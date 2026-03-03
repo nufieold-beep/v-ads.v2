@@ -822,7 +822,7 @@ function showPage(name){
     case 'advertisers':loadAdvertisers();break;
     case 'campaigns':loadCampaigns();break;
     case 'targeting':loadCampaignDropdowns();break;
-    case 'analytics':loadCampaignDropdowns();break;
+    case 'analytics':loadCampaignDropdowns().then(() => loadAnalytics());break;
     case 'health':loadDeliveryHealth();break;
   }
 }
@@ -1527,7 +1527,12 @@ document.addEventListener('DOMContentLoaded',()=>{
   $setVal('apiBaseUrl',API_BASE);
   try{const u=new URL(API_BASE);$('grafanaLink').href=`${u.protocol}//${u.hostname}:3000`}catch(e){}
   loadDashboard();
-});
+    setInterval(() => {
+      const active=document.querySelector('.nav-item.active');
+      if(active && active.dataset.page==='analytics') loadAnalytics();
+      if(active && active.dataset.page==='dashboard') loadDashboard();
+    }, 5000);
+  });
 
 document.querySelectorAll('.modal-overlay').forEach(o=>{o.addEventListener('click',e=>{if(e.target===o)o.classList.remove('active')})});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.modal-overlay.active').forEach(m=>m.classList.remove('active'))});
