@@ -39,12 +39,14 @@ logger = get_logger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DEFAULTS_VIDEO = {
-    "mimes": ["video/mp4"],
+    "mimes": ["video/mp4", "video/webm", "application/javascript"],
     "protocols": [2, 3, 4, 5, 6, 7, 8],
     "w": 1920,
     "h": 1080,
     "plcmt": 1,
     "placement": 1,
+    "pos": 1,
+    "hwv": 1,
     "linearity": 1,
     "startdelay": 0,
     "minduration": 3,
