@@ -25,6 +25,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from liteads.common.cache import CacheKeys, redis_client
+from liteads.common.countries import to_display_name as _country_name
 from liteads.common.logger import get_logger
 from liteads.common.utils import compute_derived_metrics, current_date, current_hour, safe_divide
 from liteads.models import AdEvent, Advertiser, Campaign, EventType, HourlyStat
@@ -49,24 +50,6 @@ _STAT_FIELDS = (
     "spend",
     "win_price_sum",
 )
-
-# ISO-3166-1 alpha-2 → country name (common ad-tech markets)
-_COUNTRY_NAMES: dict[str, str] = {
-    "US": "United States", "GB": "United Kingdom", "CA": "Canada",
-    "AU": "Australia", "DE": "Germany", "FR": "France", "JP": "Japan",
-    "BR": "Brazil", "IN": "India", "MX": "Mexico", "IT": "Italy",
-    "ES": "Spain", "KR": "South Korea", "NL": "Netherlands",
-    "SE": "Sweden", "NO": "Norway", "DK": "Denmark", "FI": "Finland",
-    "PL": "Poland", "AT": "Austria", "CH": "Switzerland",
-    "BE": "Belgium", "IE": "Ireland", "NZ": "New Zealand",
-    "SG": "Singapore", "HK": "Hong Kong", "TW": "Taiwan",
-    "AR": "Argentina", "CO": "Colombia", "CL": "Chile",
-    "IL": "Israel", "AE": "United Arab Emirates", "SA": "Saudi Arabia",
-    "ZA": "South Africa", "NG": "Nigeria", "EG": "Egypt",
-    "TR": "Turkey", "RU": "Russia", "CN": "China", "ID": "Indonesia",
-    "TH": "Thailand", "MY": "Malaysia", "PH": "Philippines",
-    "VN": "Vietnam",
-}
 
 
 class AnalyticsService:
@@ -246,6 +229,65 @@ class AnalyticsService:
             }
             for r in rows
         ]
+
+    # ══════════════════════════════════════════════════════════════════════
+    # 2b. Global overview (demand bucket – campaign_id = 0)
+    # ══════════════════════════════════════════════════════════════════════
+
+    async def get_global_overview(self) -> dict[str, Any]:
+        """Aggregate today's global demand stats from Redis (campaign_id=0).
+
+        In demand-only mode every VAST request and demand bid is tracked
+        under the global bucket (``stat:0:{hour}``).  This method sums all
+        24 hourly buckets to return today's totals, plus derived metrics
+        (fill_rate, vtr, eCPM, etc.).
+        """
+        today = current_date()
+        totals: dict[str, float] = {f: 0.0 for f in _STAT_FIELDS}
+
+        pipe = redis_client.pipeline()
+        for h in range(24):
+            hour_key = f"{today}{h:02d}"
+            pipe.hgetall(CacheKeys.stat_hourly(0, hour_key))
+        results = await pipe.execute()
+
+        for raw in results:
+            for f in _STAT_FIELDS:
+                totals[f] += float(raw.get(f, "0"))
+
+        ad_reqs = int(totals["ad_requests"])
+        ad_opps = int(totals["ad_opportunities"])
+        wins    = int(totals["wins"])
+        imps    = int(totals["impressions"])
+        spend   = totals["spend"]
+
+        derived = compute_derived_metrics(
+            impressions=imps, ad_requests=ad_reqs,
+            ad_opportunities=ad_opps, wins=wins, spend=spend,
+            win_price_sum=totals["win_price_sum"],
+            completions=int(totals["completions"]),
+            clicks=int(totals["clicks"]), skips=int(totals["skips"]),
+        )
+
+        return {
+            "date": today,
+            "ad_requests": ad_reqs,
+            "ad_opportunities": ad_opps,
+            "wins": wins,
+            "losses": int(totals["losses"]),
+            "errors": int(totals["errors"]),
+            "impressions": imps,
+            "starts": int(totals["starts"]),
+            "first_quartiles": int(totals["first_quartiles"]),
+            "midpoints": int(totals["midpoints"]),
+            "third_quartiles": int(totals["third_quartiles"]),
+            "completions": int(totals["completions"]),
+            "clicks": int(totals["clicks"]),
+            "skips": int(totals["skips"]),
+            "spend": round(spend, 4),
+            "win_price_sum": round(totals["win_price_sum"], 4),
+            **derived,
+        }
 
     # ══════════════════════════════════════════════════════════════════════
     # 3. All-campaigns summary
@@ -517,7 +559,7 @@ class AnalyticsService:
                 "campaign_id": cid,
                 "campaign_name": camp_name,
                 "country_code": cc,
-                "country": _COUNTRY_NAMES.get(cc, cc),
+                "country": _country_name(cc),
                 "bundle_id": row.bundle_id,
                 "ad_requests": ad_reqs,
                 "ad_opportunities": ad_opps,
@@ -674,7 +716,171 @@ class AnalyticsService:
         }
 
     # ══════════════════════════════════════════════════════════════════════
-    # 7. Redis → DB flush (HourlyStat persistence)
+    # 7. CREATIVE-LEVEL ANALYTICS (AdDecision-enriched)
+    #    Rollups by creative_id, adomain, app_bundle
+    # ══════════════════════════════════════════════════════════════════════
+
+    async def get_creative_report(
+        self,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Creative-level analytics using AdDecision join.
+
+        Groups events by the resolved creative_id from the AdDecisionLog
+        table, providing:
+        - Impressions, starts, completions per creative
+        - Render rate (start / impression)
+        - Completion rate (complete / start)
+        - Per-creative eCPM
+        """
+        from liteads.models import AdDecisionLog
+
+        filters: list[Any] = []
+        if start:
+            filters.append(AdEvent.event_time >= start)
+        if end:
+            filters.append(AdEvent.event_time <= end)
+
+        # Join events to decisions via decision_id
+        base_q = (
+            select(
+                func.coalesce(
+                    AdDecisionLog.creative_id_resolved,
+                    literal_column("'unknown'"),
+                ).label("creative_id"),
+                func.coalesce(
+                    AdDecisionLog.creative_id_source,
+                    literal_column("'none'"),
+                ).label("creative_id_source"),
+                AdEvent.event_type,
+                func.count().label("cnt"),
+                func.sum(AdEvent.cost).label("revenue"),
+                func.sum(AdEvent.win_price).label("win_price_sum"),
+            )
+            .outerjoin(
+                AdDecisionLog,
+                AdEvent.decision_id == AdDecisionLog.decision_id,
+            )
+        )
+        if filters:
+            base_q = base_q.where(*filters)
+        base_q = base_q.group_by(
+            func.coalesce(
+                AdDecisionLog.creative_id_resolved,
+                literal_column("'unknown'"),
+            ),
+            func.coalesce(
+                AdDecisionLog.creative_id_source,
+                literal_column("'none'"),
+            ),
+            AdEvent.event_type,
+        )
+
+        result = await self.session.execute(base_q)
+        rows = result.all()
+
+        # Pivot into per-creative records
+        creative_data: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            cid = row.creative_id
+            if cid not in creative_data:
+                creative_data[cid] = {
+                    "creative_id": cid,
+                    "creative_id_source": row.creative_id_source,
+                    "impressions": 0, "starts": 0, "completions": 0,
+                    "clicks": 0, "skips": 0, "errors": 0,
+                    "revenue": 0.0, "win_price_sum": 0.0,
+                }
+            d = creative_data[cid]
+            cnt = row.cnt
+            et = row.event_type
+            if et == EventType.IMPRESSION:
+                d["impressions"] = cnt
+                d["revenue"] = float(row.revenue or 0)
+                d["win_price_sum"] = float(row.win_price_sum or 0)
+            elif et == EventType.START:
+                d["starts"] = cnt
+            elif et == EventType.COMPLETE:
+                d["completions"] = cnt
+            elif et == EventType.CLICK:
+                d["clicks"] = cnt
+            elif et == EventType.SKIP:
+                d["skips"] = cnt
+            elif et == EventType.ERROR:
+                d["errors"] = cnt
+
+        report: list[dict[str, Any]] = []
+        for d in creative_data.values():
+            imps = d["impressions"]
+            starts = d["starts"]
+            completions = d["completions"]
+            revenue = d["revenue"]
+            report.append({
+                **d,
+                "render_rate": round(safe_divide(starts, imps) * 100, 2),
+                "completion_rate": round(safe_divide(completions, starts) * 100, 2),
+                "ecpm": round(safe_divide(revenue * 1000, imps), 4),
+                "avg_win_price": round(safe_divide(d["win_price_sum"], imps), 4),
+            })
+
+        return sorted(report, key=lambda r: r["impressions"], reverse=True)
+
+    async def get_decision_summary(
+        self,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Summary of recent ad decisions with creative/adomain resolution.
+
+        Returns the most recent AdDecisionLog entries with their associated
+        event counts — useful for debugging creative ID resolution and
+        adomain extraction.
+        """
+        from liteads.models import AdDecisionLog
+
+        filters: list[Any] = []
+        if start:
+            filters.append(AdDecisionLog.decision_time >= start)
+        if end:
+            filters.append(AdDecisionLog.decision_time <= end)
+
+        q = select(AdDecisionLog)
+        if filters:
+            q = q.where(*filters)
+        q = q.order_by(AdDecisionLog.decision_time.desc()).limit(limit)
+
+        result = await self.session.execute(q)
+        rows = result.scalars().all()
+
+        return [
+            {
+                "decision_id": r.decision_id,
+                "request_id": r.request_id,
+                "decision_time": r.decision_time.isoformat() if r.decision_time else None,
+                "app_bundle": r.app_bundle,
+                "geo_country": r.geo_country,
+                "device_type": r.device_type,
+                "bid_price": float(r.bid_price),
+                "net_price": float(r.net_price),
+                "seat": r.seat,
+                "creative_id_resolved": r.creative_id_resolved,
+                "creative_id_source": r.creative_id_source,
+                "crid": r.crid,
+                "adid": r.adid,
+                "vast_creative_id": r.vast_creative_id,
+                "vast_ad_id": r.vast_ad_id,
+                "adomain_primary": r.adomain_primary,
+                "adomain_source": r.adomain_source,
+                "adm_type": r.adm_type,
+                "demand_endpoint_name": r.demand_endpoint_name,
+            }
+            for r in rows
+        ]
+
+    # ══════════════════════════════════════════════════════════════════════
+    # 8. Redis → DB flush (HourlyStat persistence)
     # ══════════════════════════════════════════════════════════════════════
 
     async def flush_hourly_stats(self, hour: str | None = None) -> int:
@@ -698,6 +904,9 @@ class AnalyticsService:
 
         result = await self.session.execute(select(Campaign.id))
         campaign_ids = [r[0] for r in result.all()]
+        # Include the global demand bucket (campaign_id=0) so demand-only
+        # ad_requests and ad_opportunities are persisted to the DB.
+        campaign_ids.append(0)
 
         # Pipeline all Redis reads into one round-trip
         pipe = redis_client.pipeline()

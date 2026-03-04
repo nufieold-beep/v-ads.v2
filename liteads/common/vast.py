@@ -157,274 +157,166 @@ def _unescape_cdata(xml: str) -> str:
 
 class VASTBuilder:
     """
-    Build VAST XML documents (versions 2.0 – 4.2).
-
-    Usage::
-
-        builder = VASTBuilder(version="4.0")
-        xml_str = builder.build(creative)
+    Build VAST XML documents natively via fast string concatenation (versions 2.0 - 4.2).
     """
-
     def __init__(self, version: str = "4.0"):
         self.version = VASTVersion(version)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def _is_v4(self) -> bool:
+        return self.version in (VASTVersion.V4_0, VASTVersion.V4_1, VASTVersion.V4_2)
 
-    def build(self, creative: VASTCreative) -> str:
-        """Generate the full VAST XML string."""
-        root = self._build_tree(creative)
-        raw_xml = tostring(root, encoding="unicode", xml_declaration=False)
-
-        # Post-process CDATA markers
-        raw_xml = raw_xml.replace("__CDATA__", "<![CDATA[").replace("__ENDCDATA__", "]]>")
-
-        # Unescape HTML entities that ElementTree introduced inside CDATA.
-        # CDATA sections are literal text – &amp; must become plain &.
-        raw_xml = _unescape_cdata(raw_xml)
-        return f'<?xml version="1.0" encoding="UTF-8"?>\n{raw_xml}'
-
-    def build_wrapper(self, vast_tag_uri: str, creative: VASTCreative) -> str:
-        """Generate a VAST Wrapper pointing to another VAST tag (daisy-chaining).
-
-        A Wrapper element redirects the video player to another VAST tag
-        (``vast_tag_uri``) while allowing the ad server to inject its own
-        tracking pixels for impressions, errors, quartile events, clicks,
-        and other VAST events.
-
-        This is used when a creative has an external ``vast_url`` instead of
-        a direct ``video_url``.
-        """
-        root = Element("VAST", version=self.version.value)
-        ad = SubElement(root, "Ad", id=creative.ad_id)
-
-        # Wrapper attributes
-        wrapper_attrs: dict[str, str] = {}
-        # fallbackOnNoAd: tells the player to show a blank slate if the
-        # downstream VAST tag returns no ad (Magnite/Xandr expect this)
-        if self.version != VASTVersion.V2_0:
-            wrapper_attrs["fallbackOnNoAd"] = "true"
-        wrapper = SubElement(ad, "Wrapper", **wrapper_attrs)
-
-        # Ad system
-        ad_system = SubElement(wrapper, "AdSystem", version="1.0")
-        ad_system.text = "LiteAds"
-
-        # VASTAdTagURI – the downstream VAST tag
-        _add_cdata_element(wrapper, "VASTAdTagURI", vast_tag_uri)
-
-        # Impression
-        for url in creative.impression_urls:
-            _add_cdata_element(wrapper, "Impression", url)
-
-        # Error with [ERRORCODE] macro (IAB VAST spec requirement)
-        for url in creative.error_urls:
-            error_url = url
-            if "[ERRORCODE]" not in error_url:
-                sep = "&" if "?" in error_url else "?"
-                error_url = f"{error_url}{sep}err=[ERRORCODE]"
-            _add_cdata_element(wrapper, "Error", error_url)
-
-        # Creatives – tracking events and click tracking in wrapper
-        has_tracking = bool(creative.tracking_events)
-        has_clicks = bool(creative.click_tracking)
-        if has_tracking or has_clicks:
-            creatives_el = SubElement(wrapper, "Creatives")
-            creative_el = SubElement(creatives_el, "Creative")
-            linear = SubElement(creative_el, "Linear")
-
-            # Tracking events
-            if has_tracking:
-                tracking_events = SubElement(linear, "TrackingEvents")
-                for te in creative.tracking_events:
-                    t = SubElement(tracking_events, "Tracking", event=te.event)
-                    t.text = f"__CDATA__{te.url}__ENDCDATA__"
-
-            # VideoClicks (ClickTracking only – Wrapper cannot override ClickThrough)
-            if has_clicks:
-                video_clicks = SubElement(linear, "VideoClicks")
-                for ct_url in creative.click_tracking:
-                    _add_cdata_element(video_clicks, "ClickTracking", ct_url)
-
-        raw_xml = tostring(root, encoding="unicode", xml_declaration=False)
-        raw_xml = raw_xml.replace("__CDATA__", "<![CDATA[").replace("__ENDCDATA__", "]]>")
-        raw_xml = _unescape_cdata(raw_xml)
-        return f'<?xml version="1.0" encoding="UTF-8"?>\n{raw_xml}'
-
-    # ------------------------------------------------------------------
-    # Internal tree construction
-    # ------------------------------------------------------------------
-
-    def _build_tree(self, c: VASTCreative) -> Element:
-        root = Element("VAST", version=self.version.value)
-        ad = SubElement(root, "Ad", id=c.ad_id)
-
-        if self.version in (VASTVersion.V4_0, VASTVersion.V4_1, VASTVersion.V4_2) and c.ad_serving_id:
-            ad.set("adServingId", c.ad_serving_id)
-
-        inline = SubElement(ad, "InLine")
-
-        # AdSystem
-        ad_system = SubElement(inline, "AdSystem", version="1.0")
-        ad_system.text = "LiteAds"
-
-        # AdTitle
-        ad_title = SubElement(inline, "AdTitle")
-        ad_title.text = c.ad_title
-
-        # Description (VAST 3.0+)
+    def build(self, c: VASTCreative) -> str:
+        """Generate the full VAST XML string natively."""
+        v = self.version.value
+        is_v4 = self._is_v4()
+        
+        ad_attrs = f' id="{c.ad_id}"'
+        if is_v4 and c.ad_serving_id:
+            ad_attrs += f' adServingId="{c.ad_serving_id}"'
+            
+        parts = [f'<?xml version="1.0" encoding="UTF-8"?>\n<VAST version="{v}"><Ad{ad_attrs}><InLine>']
+        parts.append('<AdSystem version="1.0">LiteAds</AdSystem>')
+        parts.append(f'<AdTitle><![CDATA[{c.ad_title}]]></AdTitle>')
+        
         if c.description and self.version != VASTVersion.V2_0:
-            desc = SubElement(inline, "Description")
-            desc.text = c.description
-
-        # Advertiser (VAST 3.0+)
+            parts.append(f'<Description><![CDATA[{c.description}]]></Description>')
+            
         if c.advertiser and self.version != VASTVersion.V2_0:
-            adv = SubElement(inline, "Advertiser")
-            adv.text = c.advertiser
-
-        # Category (VAST 4.0+)
-        if c.category and self._is_v4():
-            cat = SubElement(inline, "Category", authority="https://iabtechlab.com")
-            cat.text = c.category
-
-        # Pricing (VAST 4.0+)
-        if c.price is not None and self._is_v4():
-            pricing = SubElement(
-                inline, "Pricing",
-                model=c.price_model,
-                currency=c.price_currency,
-            )
-            pricing.text = f"{c.price:.4f}"
-
-        # Survey (VAST 3.0+)
+            parts.append(f'<Advertiser><![CDATA[{c.advertiser}]]></Advertiser>')
+            
+        if c.category and is_v4:
+            parts.append(f'<Category authority="https://iabtechlab.com"><![CDATA[{c.category}]]></Category>')
+            
+        if c.price is not None and is_v4:
+            parts.append(f'<Pricing model="{c.price_model}" currency="{c.price_currency}"><![CDATA[{c.price:.4f}]]></Pricing>')
+            
         if c.survey_url and self.version != VASTVersion.V2_0:
-            _add_cdata_element(inline, "Survey", c.survey_url)
-
-        # Error URLs with [ERRORCODE] macro (IAB VAST spec requirement)
+            parts.append(f'<Survey><![CDATA[{c.survey_url}]]></Survey>')
+            
         for url in c.error_urls:
             error_url = url
             if "[ERRORCODE]" not in error_url:
                 sep = "&" if "?" in error_url else "?"
                 error_url = f"{error_url}{sep}err=[ERRORCODE]"
-            _add_cdata_element(inline, "Error", error_url)
-
-        # Impression URLs
+            parts.append(f'<Error><![CDATA[{error_url}]]></Error>')
+            
         for url in c.impression_urls:
-            _add_cdata_element(inline, "Impression", url)
-
-        # ViewableImpression (VAST 4.0+)
-        if self._is_v4() and c.viewable_impression:
-            vi = SubElement(inline, "ViewableImpression")
-            _add_cdata_element(vi, "Viewable", c.viewable_impression)
+            parts.append(f'<Impression><![CDATA[{url}]]></Impression>')
+            
+        if is_v4 and c.viewable_impression:
+            parts.append('<ViewableImpression>')
+            parts.append(f'<Viewable><![CDATA[{c.viewable_impression}]]></Viewable>')
             if c.not_viewable_url:
-                _add_cdata_element(vi, "NotViewable", c.not_viewable_url)
+                parts.append(f'<NotViewable><![CDATA[{c.not_viewable_url}]]></NotViewable>')
             if c.view_undetermined_url:
-                _add_cdata_element(vi, "ViewUndetermined", c.view_undetermined_url)
-
-        # AdVerifications (VAST 4.x – DoubleVerify, IAS, MOAT compatibility)
-        if self._is_v4() and c.verification_vendors:
-            ad_verifications = SubElement(inline, "AdVerifications")
+                parts.append(f'<ViewUndetermined><![CDATA[{c.view_undetermined_url}]]></ViewUndetermined>')
+            parts.append('</ViewableImpression>')
+            
+        if is_v4 and c.verification_vendors:
+            parts.append('<AdVerifications>')
             for vendor in c.verification_vendors:
-                verification = SubElement(ad_verifications, "Verification")
-                if vendor.get("vendor"):
-                    verification.set("vendor", vendor["vendor"])
+                v_attr = f' vendor="{vendor["vendor"]}"' if vendor.get("vendor") else ""
+                parts.append(f'<Verification{v_attr}>')
                 if vendor.get("js_url"):
-                    js_resource = SubElement(
-                        verification, "JavaScriptResource",
-                        apiFramework="omid",
-                        browserOptional="true",
-                    )
-                    js_resource.text = f"__CDATA__{vendor['js_url']}__ENDCDATA__"
+                    parts.append(f'<JavaScriptResource apiFramework="omid" browserOptional="true"><![CDATA[{vendor["js_url"]}]]></JavaScriptResource>')
                 if vendor.get("params"):
-                    vp = SubElement(verification, "VerificationParameters")
-                    vp.text = f"__CDATA__{vendor['params']}__ENDCDATA__"
-
-        # Creatives
-        creatives_el = SubElement(inline, "Creatives")
-        self._build_linear_creative(creatives_el, c)
-
-        # Companion ads
-        if c.companion_ads:
-            self._build_companion_ads(creatives_el, c)
-
-        return root
-
-    def _build_linear_creative(self, creatives_el: Element, c: VASTCreative) -> None:
-        creative_el = SubElement(creatives_el, "Creative", id=c.creative_id)
-
-        linear_attrs: dict[str, str] = {}
-        if c.skip_offset is not None:
-            linear_attrs["skipoffset"] = _format_duration(c.skip_offset)
-
-        linear = SubElement(creative_el, "Linear", **linear_attrs)
-
-        # Duration
-        duration = SubElement(linear, "Duration")
-        duration.text = _format_duration(c.duration)
-
-        # Tracking Events
+                    parts.append(f'<VerificationParameters><![CDATA[{vendor["params"]}]]></VerificationParameters>')
+                parts.append('</Verification>')
+            parts.append('</AdVerifications>')
+            
+        parts.append('<Creatives>')
+        
+        parts.append(f'<Creative id="{c.creative_id}">')
+        skip_attr = f' skipoffset="{_format_duration(c.skip_offset)}"' if c.skip_offset is not None else ""
+        parts.append(f'<Linear{skip_attr}>')
+        parts.append(f'<Duration>{_format_duration(c.duration)}</Duration>')
+        
         if c.tracking_events:
-            tracking_events = SubElement(linear, "TrackingEvents")
+            parts.append('<TrackingEvents>')
             for te in c.tracking_events:
-                t = SubElement(tracking_events, "Tracking", event=te.event)
-                t.text = f"__CDATA__{te.url}__ENDCDATA__"
-
-        # Video Clicks
-        video_clicks = SubElement(linear, "VideoClicks")
+                parts.append(f'<Tracking event="{te.event}"><![CDATA[{te.url}]]></Tracking>')
+            parts.append('</TrackingEvents>')
+            
+        parts.append('<VideoClicks>')
         if c.click_through:
-            _add_cdata_element(video_clicks, "ClickThrough", c.click_through)
+            parts.append(f'<ClickThrough><![CDATA[{c.click_through}]]></ClickThrough>')
         for ct_url in c.click_tracking:
-            _add_cdata_element(video_clicks, "ClickTracking", ct_url)
-
-        # Media Files
-        media_files = SubElement(linear, "MediaFiles")
+            parts.append(f'<ClickTracking><![CDATA[{ct_url}]]></ClickTracking>')
+        parts.append('</VideoClicks>')
+        
+        parts.append('<MediaFiles>')
         for mf in c.media_files:
-            attrs = {
-                "delivery": mf.delivery,
-                "type": mf.type,
-                "bitrate": str(mf.bitrate),
-                "width": str(mf.width),
-                "height": str(mf.height),
-                "scalable": str(mf.scalable).lower(),
-                "maintainAspectRatio": str(mf.maintain_aspect_ratio).lower(),
-            }
+            attrs = [
+                f'delivery="{mf.delivery}"',
+                f'type="{mf.type}"',
+                f'bitrate="{mf.bitrate}"',
+                f'width="{mf.width}"',
+                f'height="{mf.height}"',
+                f'scalable="{str(mf.scalable).lower()}"',
+                f'maintainAspectRatio="{str(mf.maintain_aspect_ratio).lower()}"'
+            ]
             if mf.codec:
-                attrs["codec"] = mf.codec
-            mf_el = SubElement(media_files, "MediaFile", **attrs)
-            mf_el.text = f"__CDATA__{mf.url}__ENDCDATA__"
+                attrs.append(f'codec="{mf.codec}"')
+            parts.append(f'<MediaFile {" ".join(attrs)}><![CDATA[{mf.url}]]></MediaFile>')
+        parts.append('</MediaFiles>')
+        parts.append('</Linear></Creative>')
+        
+        if c.companion_ads:
+            parts.append('<Creative><CompanionAds>')
+            for comp in c.companion_ads:
+                parts.append(f'<Companion width="{comp.width}" height="{comp.height}">')
+                parts.append(f'<StaticResource creativeType="{comp.resource_type}"><![CDATA[{comp.static_resource}]]></StaticResource>')
+                if comp.click_through:
+                    parts.append(f'<CompanionClickThrough><![CDATA[{comp.click_through}]]></CompanionClickThrough>')
+                if comp.tracking_events:
+                    parts.append('<TrackingEvents>')
+                    for te in comp.tracking_events:
+                        parts.append(f'<Tracking event="{te.event}"><![CDATA[{te.url}]]></Tracking>')
+                    parts.append('</TrackingEvents>')
+                parts.append('</Companion>')
+            parts.append('</CompanionAds></Creative>')
+            
+        parts.append('</Creatives></InLine></Ad></VAST>')
+        return "".join(parts)
 
-    def _build_companion_ads(self, creatives_el: Element, c: VASTCreative) -> None:
-        creative_el = SubElement(creatives_el, "Creative")
-        companion_ads = SubElement(creative_el, "CompanionAds")
-
-        for comp in c.companion_ads:
-            companion = SubElement(
-                companion_ads, "Companion",
-                width=str(comp.width),
-                height=str(comp.height),
-            )
-            static = SubElement(
-                companion, "StaticResource",
-                creativeType=comp.resource_type,
-            )
-            static.text = f"__CDATA__{comp.static_resource}__ENDCDATA__"
-
-            if comp.click_through:
-                _add_cdata_element(companion, "CompanionClickThrough", comp.click_through)
-
-            if comp.tracking_events:
-                te_el = SubElement(companion, "TrackingEvents")
-                for te in comp.tracking_events:
-                    t = SubElement(te_el, "Tracking", event=te.event)
-                    t.text = f"__CDATA__{te.url}__ENDCDATA__"
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _is_v4(self) -> bool:
-        return self.version in (VASTVersion.V4_0, VASTVersion.V4_1, VASTVersion.V4_2)
+    def build_wrapper(self, vast_tag_uri: str, creative: VASTCreative) -> str:
+        """Generate a VAST Wrapper natively via list comprehension and joins."""
+        v = self.version.value
+        fallback = ' fallbackOnNoAd="true"' if self.version != VASTVersion.V2_0 else ''
+        
+        parts = [f'<?xml version="1.0" encoding="UTF-8"?>\n<VAST version="{v}"><Ad id="{creative.ad_id}"><Wrapper{fallback}>']
+        parts.append('<AdSystem version="1.0">LiteAds</AdSystem>')
+        parts.append(f'<VASTAdTagURI><![CDATA[{vast_tag_uri}]]></VASTAdTagURI>')
+        
+        for url in creative.impression_urls:
+            parts.append(f'<Impression><![CDATA[{url}]]></Impression>')
+            
+        for url in creative.error_urls:
+            error_url = url
+            if "[ERRORCODE]" not in error_url:
+                sep = "&" if "?" in error_url else "?"
+                error_url = f"{error_url}{sep}err=[ERRORCODE]"
+            parts.append(f'<Error><![CDATA[{error_url}]]></Error>')
+            
+        has_tracking = bool(creative.tracking_events)
+        has_clicks = bool(creative.click_tracking)
+        
+        if has_tracking or has_clicks:
+            parts.append('<Creatives><Creative><Linear>')
+            if has_tracking:
+                parts.append('<TrackingEvents>')
+                for te in creative.tracking_events:
+                    parts.append(f'<Tracking event="{te.event}"><![CDATA[{te.url}]]></Tracking>')
+                parts.append('</TrackingEvents>')
+            if has_clicks:
+                parts.append('<VideoClicks>')
+                for ct_url in creative.click_tracking:
+                    parts.append(f'<ClickTracking><![CDATA[{ct_url}]]></ClickTracking>')
+                parts.append('</VideoClicks>')
+            parts.append('</Linear></Creative></Creatives>')
+            
+        parts.append('</Wrapper></Ad></VAST>')
+        return "".join(parts)
 
 
 # ---------------------------------------------------------------------------

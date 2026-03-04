@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlencode
 
 from liteads.ad_server.middleware.metrics import MetricsMiddleware, metrics_endpoint
 from liteads.ad_server.routers import ad, event, health, openrtb, vast_tag
+from liteads.ad_server.routers import settings as settings_router
 from liteads.ad_server.routers import admin as admin_router
 from liteads.ad_server.routers import analytics as analytics_router
 from liteads.ad_server.routers import auth as auth_router
@@ -228,6 +229,7 @@ def create_app() -> FastAPI:
 
     # Include routers
     app.include_router(health.router, tags=["health"])
+    app.include_router(settings_router.router)
     app.include_router(ad.router, prefix="/api/v1/ad", tags=["ad"])
     app.include_router(event.router, prefix="/api/v1/event", tags=["event"])
     app.include_router(openrtb.router, prefix="/api/v1/openrtb", tags=["openrtb"])

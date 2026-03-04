@@ -1,36 +1,13 @@
 """
-Shared tracking-URL construction for VAST events, nurl / burl / lurl.
+Shared tracking-URL construction for impression / error pixels, nurl / burl / lurl.
 
-Consolidates URL templates that were previously duplicated across
-ad.py, vast_tag.py, and openrtb_service.py (3-4 copies each).
+Tracking events (start, firstQuartile, midpoint, …) are NOT built here —
+they are provided solely by the demand/DSP response.
 """
 
 from __future__ import annotations
 
-from typing import NamedTuple
 from urllib.parse import urlencode
-
-from liteads.common.vast import TrackingEvent
-
-
-class TrackingBundle(NamedTuple):
-    """Pre-built set of VAST tracking URLs for a single ad candidate."""
-
-    events: list[TrackingEvent]
-    impression_url: str
-    error_url: str
-
-
-# ---------------------------------------------------------------------------
-# Standard VAST event names  (VAST 2.0 – 4.x)
-# ---------------------------------------------------------------------------
-
-VAST_EVENT_NAMES: tuple[str, ...] = (
-    "start", "firstQuartile", "midpoint", "thirdQuartile",
-    "complete", "mute", "unmute", "pause", "resume",
-    "skip", "fullscreen", "exitFullscreen",
-    "close", "acceptInvitation",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -45,14 +22,14 @@ def build_tracking_event_url(
     env: str,
     extra_params: str = "",
 ) -> str:
-    """Build a single VAST tracking-event pixel URL.
+    """Build a single tracking-event pixel URL.
 
     Parameters
     ----------
     base_url : str
         Server origin, e.g. ``"https://ads.example.com"``.
     event_type : str
-        VAST event name (``"impression"``, ``"start"``, …).
+        Event name (``"impression"``, ``"error"``, ``"click"``, …).
     request_id, ad_id, env : str
         Standard identifiers embedded in the query string.
     extra_params : str
@@ -63,29 +40,6 @@ def build_tracking_event_url(
         f"type={event_type}&req={request_id}&ad={ad_id}&env={env}"
         f"{extra_params}"
     )
-
-
-def build_tracking_events(
-    base_url: str,
-    request_id: str,
-    ad_id: str,
-    env: str,
-    extra_params: str = "",
-) -> list[TrackingEvent]:
-    """Build the full list of VAST video tracking events.
-
-    Returns a list of :class:`TrackingEvent` objects ready for
-    ``build_vast_xml()`` / ``build_vast_wrapper_xml()``.
-    """
-    return [
-        TrackingEvent(
-            event=name,
-            url=build_tracking_event_url(
-                base_url, name, request_id, ad_id, env, extra_params,
-            ),
-        )
-        for name in VAST_EVENT_NAMES
-    ]
 
 
 def build_impression_url(
@@ -105,25 +59,6 @@ def build_error_url(
     """Build the VAST error pixel URL."""
     return build_tracking_event_url(
         base_url, "error", request_id, ad_id, env, extra_params,
-    )
-
-
-def build_all_tracking(
-    base_url: str,
-    request_id: str,
-    ad_id: str,
-    env: str,
-    extra_params: str = "",
-) -> TrackingBundle:
-    """Build the full tracking-URL quintet in one call.
-
-    Returns a ``TrackingBundle(events, impression_url, error_url)``
-    so callers don't need to repeat three near-identical invocations.
-    """
-    return TrackingBundle(
-        events=build_tracking_events(base_url, request_id, ad_id, env, extra_params),
-        impression_url=build_impression_url(base_url, request_id, ad_id, env, extra_params),
-        error_url=build_error_url(base_url, request_id, ad_id, env, extra_params),
     )
 
 
@@ -197,12 +132,21 @@ def build_demand_extra_params(
     bundle: str | None = None,
     country: str | None = None,
     bid_price: float | None = None,
+    supply_id: int | str | None = None,
+    campaign_id: int | str | None = None,
+    decision_id: str | None = None,
 ) -> str:
     """Build a URL-encoded suffix for demand-analytics tracking params.
 
     Returns ``""`` when no params are present, or ``"&key=val&…"`` otherwise.
     """
     raw: dict[str, str] = {}
+    if decision_id:
+        raw["did"] = decision_id
+    if supply_id is not None:
+        raw["sid"] = str(supply_id)
+    if campaign_id is not None:
+        raw["cmp"] = str(campaign_id)
     if source:
         raw["src"] = source
     if adomain:

@@ -51,7 +51,8 @@ def build_vast_for_candidate(
     ad_id : str
         Tracking identifier, e.g. ``"ad_1_42"``.
     tracking_events : list[TrackingEvent]
-        Pre-built video tracking events (start, quartile, complete, …).
+        Video tracking events.  Pass an empty list — tracking events are
+        provided solely by the demand/DSP response, not injected by LiteAds.
     impression_url : str
         Impression pixel URL (used for InLine only).
     error_url : str
@@ -79,6 +80,9 @@ def build_vast_for_candidate(
     """
     if candidate.vast_url:
         # Wrapper – external VAST tag (demand/DSP).
+        # Do NOT include our <Impression> in wrappers — the downstream VAST
+        # already fires its own.  Including ours causes double-counting.
+        # We keep <Error> so broken chains are still diagnosed.
         click_tracking_url = build_click_tracking_url(
             base_url, request_id, ad_id, env,
         )
@@ -88,7 +92,7 @@ def build_vast_for_candidate(
             creative_id=str(candidate.creative_id),
             vast_tag_uri=candidate.vast_url,
             ad_title=candidate.title or "Video Ad",
-            impression_urls=[impression_url],  # Include impression to count wrapper delivery
+            impression_urls=[],
             error_urls=[error_url],
             tracking_events=tracking_events,
             click_tracking=[click_tracking_url],

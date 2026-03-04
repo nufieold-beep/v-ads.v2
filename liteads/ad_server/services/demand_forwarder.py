@@ -55,6 +55,7 @@ from liteads.schemas.openrtb import (
     Device as OrtbDevice,
     Geo as OrtbGeo,
     Imp,
+    PMP as OrtbPMP,
     Publisher as OrtbPublisher,
     Regs as OrtbRegs,
     Source as OrtbSource,
@@ -63,6 +64,28 @@ from liteads.schemas.openrtb import (
 )
 from liteads.schemas.request import AdRequest
 from liteads.common.geoip import geoip_to_ortb_geo, _to_alpha3
+from liteads.common.ortb_defaults import (
+    CONNECTION_TYPE_MAP,
+    DEFAULT_AUCTION_TYPE,
+    DEFAULT_BID_FLOOR,
+    DEFAULT_CURRENCY,
+    DEFAULT_DELIVERY,
+    DEFAULT_HEIGHT,
+    DEFAULT_LANGUAGE,
+    DEFAULT_LINEARITY,
+    DEFAULT_MAX_DURATION,
+    DEFAULT_MIN_DURATION,
+    DEFAULT_PLACEMENT,
+    DEFAULT_TMAX,
+    DEFAULT_WIDTH,
+    EID_SOURCE_MAP,
+    OS_CANONICAL,
+    PROTOCOLS_FULL,
+    STB_OS_KEYWORDS,
+    default_connection_type,
+    default_mimes,
+    default_playback,
+)
 from liteads.common.ortb_enricher import enrich_bid_request as _enrich_ortb
 from liteads.common.utils import csv_ints, csv_strs
 
@@ -73,26 +96,55 @@ _http_client: httpx.AsyncClient | None = None
 
 # ── Endpoint performance tracker (adaptive timeouts & diagnostics) ─────────
 # Tracks p95 response times and no-bid rates per endpoint for optimisation.
-_endpoint_stats: dict[int, dict] = defaultdict(lambda: {
-    "total_requests": 0,
-    "total_bids": 0,
-    "total_nobids": 0,
-    "total_timeouts": 0,
-    "total_errors": 0,
-    "latency_sum_ms": 0.0,
-    "last_success_ts": 0.0,
-})
+def _new_endpoint_stats():
+    return {
+        "total_requests": 0,
+        "total_bids": 0,
+        "total_nobids": 0,
+        "total_timeouts": 0,
+        "total_errors": 0,
+        "latency_sum_ms": 0.0,
+        "last_success_ts": 0.0,
+        "last_reset_ts": time.monotonic(),
+    }
+
+_endpoint_stats: dict[int, dict] = defaultdict(_new_endpoint_stats)
 
 # ── Retry configuration ───────────────────────────────────────────────────
-_MAX_RETRIES = 1          # One retry on transient failure (DSP 5xx / timeout)
-_RETRY_BACKOFF_MS = 50    # Base backoff — 50ms (fast retry, won't hurt tmax)
+_MAX_RETRIES = 2          # Two retries for CTV high-value inventory
+_RETRY_BACKOFF_MS = 40    # Base backoff — 40ms (faster retry for CTV)
 
 # ── In-memory cache for supply tag / mapping lookups ──────────────────────
 # Avoids a DB round-trip on every single VAST tag request.
 # TTL = 60s — supply tag changes are rare.
 _SUPPLY_CACHE_TTL = 60.0
-_supply_tag_cache: dict[str, Tuple[float, Optional[object]]] = {}
-_mapping_cache: dict[int, Tuple[float, list]] = {}
+
+class BoundedTTLCache:
+    """A bounded LRU-like dictionary to prevent memory leaks in caching."""
+    def __init__(self, maxsize: int = 2000, ttl: float = 60.0):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self.cache: dict[str, tuple[float, object]] = {}
+
+    _SENTINEL = object()  # distinguishes "cached None" from "not cached"
+
+    def get(self, key: str, default=None):
+        now = time.monotonic()
+        if key in self.cache:
+            ts, val = self.cache[key]
+            if now - ts < self.ttl:
+                return val
+            del self.cache[key]
+        return default
+
+    def set(self, key: str, value: object) -> None:
+        if len(self.cache) >= self.maxsize:
+            # Over approximate capacity, remove an arbitrary element (fastest LRU approach for 3.7+ ordered dicts)
+            self.cache.pop(next(iter(self.cache)))
+        self.cache[key] = (time.monotonic(), value)
+
+_supply_tag_cache = BoundedTTLCache(maxsize=1000, ttl=_SUPPLY_CACHE_TTL)
+_mapping_cache = BoundedTTLCache(maxsize=1000, ttl=_SUPPLY_CACHE_TTL)
 
 
 # Keys where an empty list [] or dict {} is semantically meaningful
@@ -105,31 +157,6 @@ _RE_ANDROID_VER = re.compile(r'Android\s+(\d+[\.\d]*)')
 _RE_ROKU_VER = re.compile(r'DVP-(\d+[\.\d]*)')
 # Single-pass macro substitution pattern: matches {MACRO} and ${MACRO}.
 _RE_MACRO_TOKEN = re.compile(r'\$?\{([^}]+)\}')
-
-
-def _strip_empty(obj: object) -> None:
-    """Recursively strip empty lists/dicts from a JSON-serialisable object **in-place**.
-
-    Mutates *obj* directly instead of creating a new dict/list tree,
-    avoiding O(n) allocation on every request.
-
-    Preserves empty values for keys listed in ``_KEEP_EMPTY`` because DSPs
-    interpret their presence (e.g. ``api: []`` means *no* API support).
-    """
-    if isinstance(obj, dict):
-        to_del = [
-            k for k, v in obj.items()
-            if isinstance(v, (list, dict)) and len(v) == 0 and k not in _KEEP_EMPTY
-        ]
-        for k in to_del:
-            del obj[k]
-        for v in obj.values():
-            if isinstance(v, (dict, list)):
-                _strip_empty(v)
-    elif isinstance(obj, list):
-        for item in obj:
-            if isinstance(item, (dict, list)):
-                _strip_empty(item)
 
 
 # Fields to strip from the ORTB payload to reduce size / DSP parse time.
@@ -219,11 +246,10 @@ def _slim_payload(payload: dict) -> dict:
         source.pop("ext", None)
         _strip_dict_empties(source)
 
-    # Regs — strip ext and gpp string (keep gpp_sid — DSPs need it)
+    # Regs — strip ext only; keep gpp + gpp_sid (DSPs need both for GPP)
     regs = payload.get("regs")
     if regs:
         regs.pop("ext", None)
-        regs.pop("gpp", None)
         # Rename gpp_sid → gppSid (camelCase) to match real SSP convention
         if "gpp_sid" in regs:
             regs["gppSid"] = regs.pop("gpp_sid")
@@ -250,6 +276,19 @@ def _strip_dict_empties(d: dict) -> None:
     ]
     for k in to_del:
         del d[k]
+
+
+def _slim_ortb_payload(bid_request: BidRequest) -> dict:
+    """Convert BidRequest → slim dict in one pass.
+
+    Uses Pydantic's native ``model_dump(exclude_none=True)`` so None fields
+    are never allocated, then runs ``_slim_payload`` to strip heavy optional
+    keys and empty containers.  This avoids the old double traversal where
+    the full dict was first created and *then* swept for removal.
+    """
+    payload = bid_request.model_dump(exclude_none=True)
+    _slim_payload(payload)
+    return payload
 
 
 def _stable_hash_id(value: str) -> int:
@@ -401,10 +440,9 @@ class DemandForwarder:
 
     async def _get_supply_tag(self, session: AsyncSession, slot_id: str) -> Optional[SupplyTag]:
         """Look up an active SupplyTag by its ``slot_id`` (cached, 60s TTL)."""
-        now = time.monotonic()
-        cached = _supply_tag_cache.get(slot_id)
-        if cached and (now - cached[0]) < _SUPPLY_CACHE_TTL:
-            return cached[1]
+        cached = _supply_tag_cache.get(slot_id, BoundedTTLCache._SENTINEL)
+        if cached is not BoundedTTLCache._SENTINEL:
+            return cached  # type: ignore
 
         result = await session.execute(
             select(SupplyTag).where(
@@ -413,17 +451,16 @@ class DemandForwarder:
             )
         )
         tag = result.scalars().first()
-        _supply_tag_cache[slot_id] = (now, tag)
+        _supply_tag_cache.set(slot_id, tag)
         return tag
 
     async def _get_active_mappings(
         self, session: AsyncSession, supply_tag_id: int
     ) -> list[SupplyDemandMapping]:
         """Return active mappings ordered by priority (cached, 60s TTL)."""
-        now = time.monotonic()
-        cached = _mapping_cache.get(supply_tag_id)
-        if cached and (now - cached[0]) < _SUPPLY_CACHE_TTL:
-            return cached[1]
+        cached = _mapping_cache.get(str(supply_tag_id), BoundedTTLCache._SENTINEL)
+        if cached is not BoundedTTLCache._SENTINEL:
+            return cached  # type: ignore
 
         result = await session.execute(
             select(SupplyDemandMapping)
@@ -438,7 +475,7 @@ class DemandForwarder:
             .order_by(SupplyDemandMapping.priority)
         )
         mappings = list(result.scalars().all())
-        _mapping_cache[supply_tag_id] = (now, mappings)
+        _mapping_cache.set(str(supply_tag_id), mappings)
         return mappings
 
     # ------------------------------------------------------------------
@@ -463,6 +500,13 @@ class DemandForwarder:
         ep_id = endpoint.id
         stats = _endpoint_stats[ep_id]
 
+        # ── Rolling history reset: Prevent eternal starvation ──
+        now = time.monotonic()
+        if now - stats.get("last_reset_ts", 0) > 300:  # Reset every 5 minutes
+            stats["total_requests"] = 0
+            stats["latency_sum_ms"] = 0.0
+            stats["last_reset_ts"] = now
+
         # ── Adaptive timeout: use configured value but cap at 80% of tmax
         # to leave headroom for response processing ──
         base_timeout_ms = endpoint.timeout_ms or 1500
@@ -482,7 +526,8 @@ class DemandForwarder:
             request_id=request_id,
             supply_tag=supply_tag,
             bid_floor=float(endpoint.bid_floor or Decimal("0")),
-            tmax=500,  # ORTB convention: 500ms DSP response budget
+            tmax=DEFAULT_TMAX,
+            endpoint=endpoint,
         )
 
         # Enforce a strict TOTAL timeout (not per-phase) so the DSP
@@ -494,19 +539,18 @@ class DemandForwarder:
             connect=min(timeout_s, 1.0),  # cap connect at 1s
         )
 
-        bid_payload = bid_request.model_dump(exclude_none=True)
-
-        # Single-pass: strip empties + slim payload (combined, no triple traversal)
-        _slim_payload(bid_payload)
+        # Single-pass: optimized Pydantic exclude + superficial strip
+        bid_payload = _slim_ortb_payload(bid_request)
 
         # ── Build headers ──
         device_ua = bid_payload.get("device", {}).get("ua", "")
         device_ip = bid_payload.get("device", {}).get("ip", "")
+        ortb_ver = getattr(endpoint, 'ortb_version', '2.6') or '2.6'
         fwd_headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "*/*",
             "Accept-Encoding": "gzip,deflate",
-            "X-Openrtb-Version": "2.6",
+            "X-Openrtb-Version": ortb_ver,
         }
         if device_ua:
             fwd_headers["User-Agent"] = device_ua
@@ -558,6 +602,37 @@ class DemandForwarder:
         # Pre-serialise with orjson (5-10x faster than stdlib json used by httpx)
         bid_bytes = orjson.dumps(bid_payload)
 
+        # ── Regional URL selection ──
+        # If the endpoint has regional URLs configured, select the best one
+        # based on the geo from the bid request.  Falls back to the primary
+        # endpoint_url when no regional match is found.
+        target_url = endpoint.endpoint_url
+        regional_urls = getattr(endpoint, 'regional_urls', None)
+        if regional_urls and isinstance(regional_urls, dict) and regional_urls:
+            # Try to match region from bid request geo
+            _geo_data = bid_payload.get("device", {}).get("geo", {})
+            _country = (_geo_data.get("country") or "").upper()
+            _region = (_geo_data.get("region") or "").upper()
+            # Build a search key from country + region for matching
+            _geo_key = f"{_country} {_region}".strip().lower()
+
+            # Check each regional URL key (case-insensitive substring match)
+            for region_name, region_url in regional_urls.items():
+                _rname = region_name.lower()
+                # Match on country code, region name, or geographic area
+                if (_country and _country.lower() in _rname) or \
+                   (_region and _region.lower() in _rname) or \
+                   (_geo_key and any(part in _rname for part in _geo_key.split() if len(part) > 1)):
+                    target_url = region_url
+                    logger.debug(
+                        "Using regional URL",
+                        endpoint=endpoint.name,
+                        region=region_name,
+                        url=region_url,
+                        country=_country,
+                    )
+                    break
+
         # ── Send request with retry on transient failures ──
         last_error: Exception | None = None
         for attempt in range(_MAX_RETRIES + 1):
@@ -575,7 +650,7 @@ class DemandForwarder:
             try:
                 client = _get_http_client()
                 response = await client.post(
-                    endpoint.endpoint_url,
+                    target_url,
                     content=bid_bytes,
                     headers=fwd_headers,
                     timeout=request_timeout,
@@ -734,9 +809,9 @@ class DemandForwarder:
             )
 
             return AdCandidate(
-                # Use 0 / negative IDs to distinguish from local campaigns
-                campaign_id=0,
-                creative_id=vast_tag.id * -1,
+                # Use VAST tag ID as campaign_id so tracking pixels carry the real demand source
+                campaign_id=vast_tag.id,
+                creative_id=vast_tag.id,
                 advertiser_id=0,
                 bid=float(vast_tag.cpm_value or Decimal("0")),
                 title=vast_tag.name or "Demand VAST",
@@ -790,18 +865,6 @@ class DemandForwarder:
     # Build OpenRTB 2.6 BidRequest  (IAB / IAV / CTV-IFA compliant)
     # ------------------------------------------------------------------
 
-    # ── CTV / In-App platform constants ───────────────────────────
-
-    # Mapping from OS string → canonical OS name for the ORTB payload
-    _OS_CANONICAL: dict[str, str] = {
-        "roku": "Roku", "rokuos": "Roku",
-        "firetv": "Fire OS", "fireos": "Fire OS",
-        "tvos": "tvOS", "tizen": "Tizen", "webos": "webOS",
-        "webostv": "webOS", "vizio": "SmartCast", "androidtv": "Android",
-        "googletv": "Android", "chromecast": "Android",
-        "android": "Android", "ios": "iOS",
-    }
-
     @staticmethod
     def _build_bid_request(
         ad_request: AdRequest,
@@ -809,6 +872,7 @@ class DemandForwarder:
         supply_tag: SupplyTag,
         bid_floor: float = 0.0,
         tmax: int = 500,
+        endpoint: DemandEndpoint | None = None,
     ) -> BidRequest:
         """Construct a fully IAB OpenRTB 2.6 / IAV-compliant BidRequest.
 
@@ -849,25 +913,16 @@ class DemandForwarder:
             )
 
         # ── protocols (§5.8): VAST versions supported
-        # CTV players universally accept VAST 2/3/4.x; in-app may also support VPAID
+        # Prefer endpoint-configured protocols, then ad-request, then defaults
         vid_protocols = csv_ints(v.video_protocols if v else None)
+        if not vid_protocols and endpoint and endpoint.protocols:
+            vid_protocols = list(endpoint.protocols)
         if not vid_protocols:
-            # 2=VAST2.0, 3=VAST3.0, 4=VAST2.0-Wrapper, 5=VAST3.0-Wrapper,
-            # 6=VAST4.0, 7=VAST4.1, 8=VAST4.2
-            vid_protocols = [2, 3, 4, 5, 6, 7, 8]
-            if not is_ctv:
-                # In-app may support VPAID 2.0 JS (§5.8 value 3 is taken;
-                # VPAID is signalled via api[] instead).
-                pass
+            vid_protocols = list(PROTOCOLS_FULL)
 
-        # ── mimes – CTV emphasises MP4/HLS; in-app adds WebM/DASH
-        default_mimes = (
-            ["video/mp4", "application/x-mpegURL"]
-            if is_ctv
-            else ["video/mp4", "video/webm", "application/x-mpegURL",
-                  "application/dash+xml"]
-        )
-        mimes = v.mimes if v and v.mimes else default_mimes
+        # ── mimes – Prefer endpoint-configured, then CTV/in-app defaults
+        ep_mimes = (endpoint.mime_types if endpoint and endpoint.mime_types else None)
+        mimes = v.mimes if v and v.mimes else (ep_mimes or default_mimes(is_ctv))
 
         # ── placement / plcmt (§5.9 / §5.9.1 OpenRTB 2.6)
         # plcmt=1 (In-stream) is the standard for both CTV and in-app video
@@ -876,29 +931,29 @@ class DemandForwarder:
             plcmt = pub_plcmt
             placement = pub_plcmt
         else:
-            plcmt = 1      # In-Stream (IAB default for CTV/video)
-            placement = 1
+            plcmt = DEFAULT_PLACEMENT
+            placement = DEFAULT_PLACEMENT
 
         # ── linearity (§5.7): 1=Linear (in-stream), 2=Non-linear/overlay
-        linearity = v.linearity if v and v.linearity else 1
+        linearity = v.linearity if v and v.linearity else DEFAULT_LINEARITY
 
         # ── playbackmethod (§5.10):
         #    CTV: 1=Page-load sound-on (auto-play with sound)
         #    In-app: may use 2=on-click, 5=auto-play-viewport-sound-on
         playback = csv_ints(v.playbackmethod if v else None)
         if not playback:
-            playback = [1] if is_ctv else [1, 5]
+            playback = default_playback(is_ctv)
 
         # ── delivery (§5.15): 1=Streaming, 2=Progressive, 3=Download
-        delivery = csv_ints(v.delivery if v else None) or [2, 1]
+        delivery = csv_ints(v.delivery if v else None) or list(DEFAULT_DELIVERY)
 
         # ── Video dimensions / durations
-        width = v.width if v and v.width else supply_tag.width or 1920
-        height = v.height if v and v.height else supply_tag.height or 1080
+        width = v.width if v and v.width else supply_tag.width or DEFAULT_WIDTH
+        height = v.height if v and v.height else supply_tag.height or DEFAULT_HEIGHT
         minduration = (v.min_duration if v and v.min_duration
-                       else supply_tag.min_duration or 1)
+                       else supply_tag.min_duration or DEFAULT_MIN_DURATION)
         maxduration = (v.max_duration if v and v.max_duration
-                       else supply_tag.max_duration or 120)
+                       else supply_tag.max_duration or DEFAULT_MAX_DURATION)
 
         video = OrtbVideo(
             mimes=mimes,
@@ -944,6 +999,7 @@ class DemandForwarder:
             secure=1,
             instl=1 if is_ctv else 0,  # CTV is always full-screen
             exp=ad_request.imp_exp,     # impression expiry from publisher
+            pmp=OrtbPMP(private_auction=0),  # 0 = open auction (increases DSP bid rate)
         )
 
         # ══════════════════════════════════════════════════════════════
@@ -995,9 +1051,8 @@ class DemandForwarder:
                     # §5.21: 3=Connected TV, 7=Set-Top Box
                     # Differentiate by OS – Roku/FireTV sticks are STBs
                     os_key = (d.os or "").lower().replace(" ", "")
-                    stb_keywords = ("roku", "firetv", "fireos", "chromecast")
                     device_type = (
-                        7 if any(k in os_key for k in stb_keywords) else 3
+                        7 if any(k in os_key for k in STB_OS_KEYWORDS) else 3
                     )
                 else:
                     # §5.21: 1=Mobile/Tablet, 4=Phone, 5=Tablet
@@ -1006,7 +1061,7 @@ class DemandForwarder:
             # ── Canonical OS name ─────────────────────────────────
             raw_os = (d.os or "").strip()
             os_key = raw_os.lower().replace(" ", "")
-            canonical_os = DemandForwarder._OS_CANONICAL.get(os_key, raw_os or "unknown")
+            canonical_os = OS_CANONICAL.get(os_key, raw_os or "unknown")
 
             # ── Separate IPv4 / IPv6 per ORTB 2.6 spec ───────────
             raw_ip = d.ip or ""
@@ -1060,15 +1115,9 @@ class DemandForwarder:
             # present — especially Ethernet for CTV.
             conn_type: int | None = None
             if d.connection_type:
-                _ct_map = {
-                    "ethernet": 1, "wifi": 2,
-                    "cellular_unknown": 3, "2g": 4, "3g": 5,
-                    "4g": 6, "5g": 7,
-                }
-                conn_type = _ct_map.get(d.connection_type)
+                conn_type = CONNECTION_TYPE_MAP.get(d.connection_type)
             if conn_type is None:
-                # Default: CTV → Ethernet, in-app → WiFi
-                conn_type = 1 if is_ctv else 2
+                conn_type = default_connection_type(is_ctv)
 
             device = OrtbDevice(
                 ua=d.ua,
@@ -1077,7 +1126,7 @@ class DemandForwarder:
                 ipv6=ip_v6,
                 geo=geo,
                 carrier=carrier,
-                language=d.language or "en",
+                language=d.language or DEFAULT_LANGUAGE,
                 os=canonical_os,
                 osv=osv,
                 devicetype=device_type,
@@ -1246,16 +1295,7 @@ class DemandForwarder:
         eids: list[dict] = []
         if user_ifa and ad_request.device and ad_request.device.ifa_type:
             ifa_t = ad_request.device.ifa_type.lower()
-            eid_source_map: dict[str, str] = {
-                "rida": "roku.com",
-                "afai": "amazon.com",
-                "idfa": "apple.com",
-                "gaid": "google.com",
-                "tifa": "samsung.com",
-                "lgudid": "lgappstv.com",
-                "vida": "vizio.com",
-            }
-            source_domain = eid_source_map.get(ifa_t)
+            source_domain = EID_SOURCE_MAP.get(ifa_t)
             if source_domain:
                 eids.append({
                     "source": source_domain,
@@ -1293,10 +1333,22 @@ class DemandForwarder:
         #    COPPA + GDPR + CCPA only — no ext, gpp (matches target schema)
         # ══════════════════════════════════════════════════════════════
 
+        # ── Privacy: forward ALL publisher-provided regs to the DSP ──
+        _gdpr_ext: dict | None = None
+        if ad_request.gdpr is not None or ad_request.gdpr_consent:
+            _gdpr_ext = {}
+            if ad_request.gdpr is not None:
+                _gdpr_ext["gdpr"] = ad_request.gdpr
+            if ad_request.gdpr_consent:
+                _gdpr_ext["consent"] = ad_request.gdpr_consent
+
         regs = OrtbRegs(
             coppa=ad_request.coppa if ad_request.coppa is not None else 0,
+            gdpr=ad_request.gdpr,
             us_privacy=ad_request.us_privacy or None,
-            gpp_sid=[0],  # GPP section IDs (0 = no section applies)
+            gpp=ad_request.gpp or None,
+            gpp_sid=csv_ints(ad_request.gpp_sid) if ad_request.gpp_sid else None,
+            ext=_gdpr_ext,
         )
 
         # ══════════════════════════════════════════════════════════════
@@ -1310,18 +1362,24 @@ class DemandForwarder:
         # 9. ASSEMBLE BidRequest  (Section 3.2.1)
         # ══════════════════════════════════════════════════════════════
 
+        # ── Auction type from endpoint config (1=first-price, 2=second-price)
+        ep_auction_type = (
+            endpoint.auction_type if endpoint and endpoint.auction_type
+            else DEFAULT_AUCTION_TYPE
+        )
+
         bid_req = BidRequest(
             id=request_id,
             imp=[imp],
             app=app,
             device=device,
             user=user,
-            at=1,            # First-price auction (industry standard since 2019)
+            at=ep_auction_type,
             tmax=tmax,
             source=source,
             regs=regs,
             allimps=0,       # 0 = exchange cannot verify all impressions
-            cur=["USD"],
+            cur=[DEFAULT_CURRENCY],
             bcat=bcat_list,
             badv=badv_list,
             ext={},
@@ -1341,14 +1399,28 @@ class DemandForwarder:
         return bid_req
 
     @staticmethod
-    def _replace_auction_macros(text: str | None, price: float) -> str | None:
-        """Replace ``${AUCTION_PRICE}`` in *text* with formatted price."""
+    def _replace_auction_macros(
+        text: str | None,
+        price: float,
+        *,
+        bid_id: str = "",
+        imp_id: str = "",
+        seat_id: str = "",
+        ad_id: str = "",
+        currency: str = "USD",
+    ) -> str | None:
+        """Replace all ``${AUCTION_*}`` macros per OpenRTB 2.6 §4.4."""
         if not text:
             return text
-        if "${AUCTION_PRICE}" not in text:
+        if "${AUCTION_" not in text:
             return text
-        formatted = f"{price:.2f}"
-        return text.replace("${AUCTION_PRICE}", formatted)
+        text = text.replace("${AUCTION_PRICE}", f"{price:.2f}")
+        text = text.replace("${AUCTION_BID_ID}", bid_id)
+        text = text.replace("${AUCTION_IMP_ID}", imp_id)
+        text = text.replace("${AUCTION_SEAT_ID}", seat_id)
+        text = text.replace("${AUCTION_AD_ID}", ad_id)
+        text = text.replace("${AUCTION_CURRENCY}", currency)
+        return text
 
     @staticmethod
     def _extract_candidates(
@@ -1365,9 +1437,11 @@ class DemandForwarder:
                 # Apply margin
                 net_bid = bid.price * (1.0 - margin)
 
+                _crid_hash = _stable_hash_id(bid.crid or bid.id)
                 candidate = AdCandidate(
-                    campaign_id=0,
-                    creative_id=_stable_hash_id(bid.crid or bid.id),
+                    # Use endpoint ID as campaign_id so tracking pixels carry the real demand source
+                    campaign_id=endpoint.id,
+                    creative_id=_crid_hash,
                     advertiser_id=0,
                     bid=net_bid,
                     title=f"Demand: {endpoint.name}",
@@ -1383,11 +1457,19 @@ class DemandForwarder:
                         "bid_price": bid.price,
                         "adomain": bid.adomain,
                         "crid": bid.crid,
+                        "adid": bid.adid or bid.crid or bid.id,
+                        "deal_id": bid.dealid,
+                        "cat": bid.cat,
+                        "bid_ext": bid.ext,
                         "nurl": DemandForwarder._replace_auction_macros(
-                            bid.nurl, bid.price
+                            bid.nurl, bid.price,
+                            bid_id=bid.id, imp_id=bid.impid,
+                            seat_id=seatbid.seat or "", ad_id=bid.adid or "",
                         ),
                         "burl": DemandForwarder._replace_auction_macros(
-                            bid.burl, bid.price
+                            bid.burl, bid.price,
+                            bid_id=bid.id, imp_id=bid.impid,
+                            seat_id=seatbid.seat or "", ad_id=bid.adid or "",
                         ),
                     },
                 )
@@ -1396,17 +1478,25 @@ class DemandForwarder:
                 # Replace ${AUCTION_PRICE} macros with actual bid price
                 # (same as the Node.js BidProcessor pattern).
                 _price = bid.price
+                _macro_kw = dict(
+                    bid_id=bid.id, imp_id=bid.impid,
+                    seat_id=seatbid.seat or "", ad_id=bid.adid or "",
+                )
                 if bid.adm:
                     # adm contains VAST XML – store in metadata
                     candidate.vast_url = None
                     candidate.video_url = ""
                     candidate.metadata["adm"] = (
-                        DemandForwarder._replace_auction_macros(bid.adm, _price)
+                        DemandForwarder._replace_auction_macros(
+                            bid.adm, _price, **_macro_kw,
+                        )
                     )
                 elif bid.nurl:
                     # nurl may return VAST when called; use as wrapper URI
                     candidate.vast_url = (
-                        DemandForwarder._replace_auction_macros(bid.nurl, _price)
+                        DemandForwarder._replace_auction_macros(
+                            bid.nurl, _price, **_macro_kw,
+                        )
                     )
                 else:
                     logger.warning(
@@ -1654,6 +1744,11 @@ class DemandForwarder:
             # Device extended
             "osv": osv,
             "os_version": osv,
+            # Slot / campaign identity (auto-match creative number)
+            "sid": ad_request.slot_id or "",
+            "slot_id": ad_request.slot_id or "",
+            "supply_id": ad_request.slot_id or "",
+            "campaign_id": str(ad_request.slot_id or ""),
             # Other
             "vast_version": "2",
         }

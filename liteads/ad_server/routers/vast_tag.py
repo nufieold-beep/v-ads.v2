@@ -34,6 +34,7 @@ from liteads.ad_server.services.ad_service import AdService
 from liteads.ad_server.services.demand_forwarder import DemandForwarder, _get_http_client
 from liteads.ad_server.services.event_service import EventService
 from liteads.ad_server.services.vast_builder import build_vast_for_candidate
+from liteads.ad_server.routers.analytics import capture_traffic_event
 from liteads.common.config import get_settings
 from liteads.common.database import get_session
 from liteads.common.device import (
@@ -42,18 +43,24 @@ from liteads.common.device import (
     infer_os_from_ua,
     map_placement,
 )
+from liteads.common.extraction import (
+    detect_adm_type,
+    extract_adomain,
+    extract_creative_id,
+)
 from liteads.common.geoip import geoip_to_geo_info
 from liteads.common.logger import get_logger, log_context
 from liteads.common.tracking import (
     build_ad_id,
-    build_all_tracking,
     build_burl,
     build_demand_extra_params,
+    build_error_url,
+    build_impression_url,
     build_nurl,
     empty_vast_response,
 )
 from liteads.common.utils import extract_client_ip, generate_request_id
-from liteads.common.vast import TrackingEvent
+from liteads.schemas.internal import AdDecision
 from liteads.schemas.request import (
     AdRequest,
     AppInfo,
@@ -288,6 +295,21 @@ async def vast_tag(
     make = (device_make or "").strip()
     model = (device_model or "").strip()
 
+    # ── Capture inbound VAST request for live traffic inspector ──
+    capture_traffic_event("vast_request", request_id, {
+        "environment": env,
+        "sid": sid,
+        "ip": ip,
+        "ua": ua_str[:120] if ua_str else None,
+        "app_bundle": app_bundle,
+        "app_name": app_name,
+        "w": w,
+        "h": h,
+        "make": make,
+        "model": model,
+        "os": os_str,
+    })
+
     log_context(
         request_id=request_id,
         slot_id=sid,
@@ -448,27 +470,13 @@ async def vast_tag(
     )
 
     # Run pipeline ---------------------------------------------------------
-    # Run local campaigns and demand forwarding in parallel.
+    # Demand-only: forward to mapped ORTB/VAST demand sources.
+    # Local campaigns are NOT used — all fill comes from demand partners.
     try:
-        local_task = asyncio.create_task(
-            ad_service.serve_ads(request=ad_request, request_id=request_id)
-        )
-        demand_task = asyncio.create_task(
-            demand_forwarder.forward(ad_request=ad_request, request_id=request_id)
+        demand_candidates = await demand_forwarder.forward(
+            ad_request=ad_request, request_id=request_id
         )
 
-        local_candidates, demand_candidates = await asyncio.gather(
-            local_task, demand_task, return_exceptions=True,
-        )
-
-        # Handle exceptions from either task
-        if isinstance(local_candidates, Exception):
-            logger.exception(
-                "Local pipeline error",
-                request_id=request_id,
-                error=str(local_candidates),
-            )
-            local_candidates = []
         if isinstance(demand_candidates, Exception):
             logger.warning(
                 "Demand forwarding error",
@@ -477,16 +485,13 @@ async def vast_tag(
             )
             demand_candidates = []
 
-        # Merge and sort by bid (highest first)
-        candidates = [*local_candidates, *demand_candidates]
+        candidates = list(demand_candidates)
         candidates.sort(key=lambda c: c.bid, reverse=True)
 
         logger.debug(
-            "Pipeline results merged",
+            "Demand-only pipeline complete",
             request_id=request_id,
-            local_count=len(local_candidates),
-            demand_count=len(demand_candidates),
-            total=len(candidates),
+            demand_count=len(candidates),
         )
     except Exception:
         logger.exception("VAST tag pipeline error", request_id=request_id)
@@ -495,29 +500,14 @@ async def vast_tag(
         return _empty_vast_response(request_id)
 
     # ── Track ad_requests & ad_opportunities in Redis ─────────────
-    # Local campaign candidates have campaign_id > 0.
-    # Demand ORTB/VAST candidates have campaign_id == 0 (tracked globally).
-    local_campaign_ids = [
-        c.campaign_id for c in candidates if c.campaign_id > 0
-    ]
-    has_demand_fill = any(c.campaign_id == 0 for c in candidates)
-
-    # ad_requests: track per local campaign + global bucket
-    tracking_ids = list(local_campaign_ids)
-    if has_demand_fill or not local_campaign_ids:
-        tracking_ids.append(0)  # 0 = global / demand bucket
-    asyncio.create_task(
-        EventService.track_ad_request(tracking_ids if tracking_ids else None)
-    )
-
-    # ad_opportunities: track for every campaign that produced a candidate
-    opp_ids = list(local_campaign_ids)
-    if has_demand_fill:
-        opp_ids.append(0)  # demand fill also counts as an opportunity
-    if opp_ids:
-        asyncio.create_task(
-            EventService.track_ad_opportunity(opp_ids)
-        )
+    # campaign_id = dashboard campaign (0 for demand-only).
+    # creative_id = from demand response (DSP crid / VAST tag id).
+    # Always include 0 (global bucket) alongside actual campaign IDs.
+    _candidate_cids = list({c.campaign_id for c in candidates}) if candidates else []
+    _track_cids = [0] + [c for c in _candidate_cids if c != 0]
+    asyncio.create_task(EventService.track_ad_request(_track_cids))
+    if candidates:
+        asyncio.create_task(EventService.track_ad_opportunity(_track_cids))
 
     if not candidates:
         logger.debug("VAST tag no fill", request_id=request_id)
@@ -532,41 +522,108 @@ async def vast_tag(
     _meta = candidate.metadata or {}
     _adm_raw = _meta.get("adm")
 
-    # For adm (DSP inline VAST), parse real Ad/Creative IDs BEFORE building
-    # tracking URLs so we only call build_all_tracking() once with the final
-    # ad_id — eliminates ~30 redundant object creations per adm response.
+    # ── Creative ID extraction (multi-source priority chain) ──────────
+    _crid_result = extract_creative_id(
+        bid_crid=_meta.get("crid"),
+        bid_adid=_meta.get("adid"),
+        bid_id=_meta.get("bid_id"),
+        adm=_adm_raw,
+    )
+
+    # ── Adomain extraction (multi-source priority chain) ──────────────
+    _adomain_result = extract_adomain(
+        bid_adomain=_meta.get("adomain"),
+        adm=_adm_raw,
+        bid_ext=_meta.get("bid_ext"),
+    )
+
+    # ── Determine adm type (inline / wrapper / nurl / vast_tag) ───────
+    _adm_type, _wrapper_depth = detect_adm_type(
+        adm=_adm_raw,
+        vast_url=candidate.vast_url,
+        has_nurl=bool(_meta.get("nurl")),
+    )
+
+    # For adm (DSP inline VAST), check for media files
+    _has_media = True
     if _adm_raw:
         _parsed = _parse_adm_vast(_adm_raw)
-        if not _parsed["has_media"]:
+        _has_media = _parsed["has_media"]
+        if not _has_media:
             logger.warning(
                 "DSP adm has no MediaFile – skipping",
                 request_id=request_id,
             )
             return _empty_vast_response(request_id)
-        # Note: We do NOT override ad_id with DSP string IDs here, because 
-        # our event tracker requires ad_id to be parsable as ad_{camp}_{hash_int}.
 
-    _adomain_list = _meta.get("adomain") or []
-    _adomain = _adomain_list[0] if _adomain_list else ""
+    # ── Build AdDecision canonical record ─────────────────────────────
+    decision = AdDecision(
+        request_id=request_id,
+        imp_id=str(imp),
+        bid_id=_meta.get("bid_id", ""),
+        # Supply / context
+        app_bundle=ad_request.app.app_bundle or "",
+        app_name=ad_request.app.app_name or "",
+        domain=ad_request.app.app_domain or "",
+        publisher_id=ad_request.app.publisher_id or "",
+        device_type=env,
+        os=(ad_request.device.os or ""),
+        geo_country=ad_request.geo.country or "",
+        geo_region=ad_request.geo.region or "",
+        ip=ad_request.device.ip or "",
+        ifa=ad_request.device.ifa or "",
+        supply_tag_id=sid,
+        # Auction
+        bid_floor=ad_request.bidfloor_override or 0.0,
+        bid_price=_meta.get("bid_price", candidate.bid),
+        net_price=candidate.bid,
+        seat=_meta.get("seat", ""),
+        deal_id=_meta.get("deal_id", ""),
+        demand_endpoint_id=_meta.get("demand_endpoint_id", 0),
+        demand_endpoint_name=_meta.get("endpoint_name", ""),
+        # Creative identification (from extraction chain)
+        creative_id=_crid_result.creative_id,
+        creative_id_source=_crid_result.source,
+        crid=_crid_result.crid,
+        adid=_crid_result.adid,
+        vast_creative_id=_crid_result.vast_creative_id,
+        vast_ad_id=_crid_result.vast_ad_id,
+        duration=candidate.duration,
+        width=candidate.width,
+        height=candidate.height,
+        # Adomain (from extraction chain)
+        adomain=_adomain_result.adomain,
+        adomain_primary=_adomain_result.primary,
+        adomain_source=_adomain_result.source,
+        iab_categories=_meta.get("cat", []),
+        # Markup / VAST
+        adm_type=_adm_type,
+        has_media=_has_media,
+        vast_wrapper_depth=_wrapper_depth,
+    )
+
+    _adomain = _adomain_result.primary
     # Always brand source as viadsmedia.com (cross-platform ad server)
     _src = "viadsmedia.com"
     _bundle = ad_request.app.app_bundle or ""
     _country = ad_request.geo.country or ""
     _bid_price = round(candidate.bid, 4)
 
-    # URL-safe extra params for demand analytics
+    # URL-safe extra params for demand analytics (now includes decision_id)
     _tracking_suffix = build_demand_extra_params(
         source=_src, adomain=_adomain, bundle=_bundle,
         country=_country, bid_price=_bid_price,
+        supply_id=sid, campaign_id=candidate.campaign_id,
+        decision_id=decision.decision_id,
     )
 
-    # Build VAST tracking events (shared helper — single call with final ad_id)
-    trk = build_all_tracking(
+    # Build impression + error pixels only (tracking events come from demand)
+    impression_url = build_impression_url(
         base_url, request_id, ad_id, env, _tracking_suffix,
     )
-    tracking_events = trk.events
-    impression_url = trk.impression_url
-    error_url = trk.error_url
+    error_url = build_error_url(
+        base_url, request_id, ad_id, env, _tracking_suffix,
+    )
 
     # nurl / burl (auction price notification)
     nurl = build_nurl(base_url, request_id, ad_id, env)
@@ -589,7 +646,6 @@ async def vast_tag(
             adm=_adm_raw,
             impression_url=impression_url,
             error_url=error_url,
-            tracking_events=tracking_events,
         )
         # Fire the demand partner's nurl (win notification) in background
         demand_nurl = _meta.get("nurl")
@@ -603,7 +659,7 @@ async def vast_tag(
             candidate,
             vast_version=vast_version,
             ad_id=ad_id,
-            tracking_events=tracking_events,
+            tracking_events=[],
             impression_url=impression_url,
             error_url=error_url,
             base_url=base_url,
@@ -626,10 +682,22 @@ async def vast_tag(
         "VAST tag served",
         request_id=request_id,
         ad_id=ad_id,
+        decision_id=decision.decision_id,
         creative_id=candidate.creative_id,
+        creative_id_resolved=decision.creative_id,
+        creative_id_source=decision.creative_id_source,
+        adomain=decision.adomain_primary,
+        adomain_source=decision.adomain_source,
+        adm_type=decision.adm_type,
         cpm=round(candidate.bid, 4),
         environment=env,
         source=candidate.metadata.get("source", "local"),
+    )
+
+    # ── Persist AdDecision to Redis (non-blocking, TTL 48h) ───────────
+    # Stored as a hash so event tracking can join decision context.
+    asyncio.create_task(
+        _store_ad_decision(decision)
     )
 
     return Response(
@@ -643,22 +711,132 @@ async def vast_tag(
     )
 
 
+# ---------------------------------------------------------------------------
+# AdDecision persistence (Redis + optional DB)
+# ---------------------------------------------------------------------------
+
+_DECISION_TTL = 48 * 3600  # 48 hours — matches stat retention
+
+async def _store_ad_decision(decision: AdDecision) -> None:
+    """Store AdDecision in Redis (immediate lookup) and PostgreSQL (persistent).
+
+    Redis key: ``decision:{decision_id}`` with 48-hour TTL.
+    Events that arrive with ``did=`` in their tracking URL can look up the
+    Redis hash to enrich analytics.  DB persistence enables historical
+    creative/adomain analytics rollups.
+    """
+    # ── 1. Redis (fast, for real-time event joining) ──────────────────
+    try:
+        import json
+        from liteads.common.cache import redis_client
+
+        key = f"decision:{decision.decision_id}"
+        data = {
+            "request_id": decision.request_id,
+            "imp_id": decision.imp_id,
+            "bid_id": decision.bid_id,
+            "app_bundle": decision.app_bundle,
+            "app_name": decision.app_name,
+            "domain": decision.domain,
+            "device_type": decision.device_type,
+            "os": decision.os,
+            "geo_country": decision.geo_country,
+            "geo_region": decision.geo_region,
+            "supply_tag_id": decision.supply_tag_id,
+            "bid_price": str(decision.bid_price),
+            "net_price": str(decision.net_price),
+            "seat": decision.seat,
+            "deal_id": decision.deal_id,
+            "demand_endpoint_id": str(decision.demand_endpoint_id),
+            "demand_endpoint_name": decision.demand_endpoint_name,
+            "creative_id": decision.creative_id,
+            "creative_id_source": decision.creative_id_source,
+            "crid": decision.crid,
+            "adid": decision.adid,
+            "vast_creative_id": decision.vast_creative_id,
+            "vast_ad_id": decision.vast_ad_id,
+            "duration": str(decision.duration),
+            "adomain": json.dumps(decision.adomain),
+            "adomain_primary": decision.adomain_primary,
+            "adomain_source": decision.adomain_source,
+            "iab_categories": json.dumps(decision.iab_categories),
+            "adm_type": decision.adm_type,
+            "has_media": "1" if decision.has_media else "0",
+            "vast_wrapper_depth": str(decision.vast_wrapper_depth),
+        }
+        pipe = redis_client.pipeline()
+        pipe.hset(key, mapping=data)
+        pipe.expire(key, _DECISION_TTL)
+        await pipe.execute()
+    except Exception as exc:
+        logger.warning("Failed to store AdDecision in Redis: %s", exc)
+
+    # ── 2. PostgreSQL (persistent, for analytics rollups) ─────────────
+    try:
+        from liteads.common.database import db
+        from liteads.models import AdDecisionLog
+
+        async with db.session() as session:
+            log_entry = AdDecisionLog(
+                decision_id=decision.decision_id,
+                request_id=decision.request_id,
+                imp_id=decision.imp_id,
+                bid_id=decision.bid_id,
+                app_bundle=decision.app_bundle or None,
+                app_name=decision.app_name or None,
+                domain=decision.domain or None,
+                publisher_id=decision.publisher_id or None,
+                device_type=decision.device_type or None,
+                os=decision.os or None,
+                geo_country=decision.geo_country or None,
+                geo_region=decision.geo_region or None,
+                ip=decision.ip or None,
+                supply_tag_id=decision.supply_tag_id or None,
+                bid_floor=decision.bid_floor,
+                bid_price=decision.bid_price,
+                net_price=decision.net_price,
+                seat=decision.seat or None,
+                deal_id=decision.deal_id or None,
+                demand_endpoint_id=decision.demand_endpoint_id or None,
+                demand_endpoint_name=decision.demand_endpoint_name or None,
+                creative_id_resolved=decision.creative_id or None,
+                creative_id_source=decision.creative_id_source or None,
+                crid=decision.crid or None,
+                adid=decision.adid or None,
+                vast_creative_id=decision.vast_creative_id or None,
+                vast_ad_id=decision.vast_ad_id or None,
+                duration=decision.duration,
+                width=decision.width,
+                height=decision.height,
+                adomain_list=decision.adomain if decision.adomain else None,
+                adomain_primary=decision.adomain_primary or None,
+                adomain_source=decision.adomain_source or None,
+                iab_categories=decision.iab_categories if decision.iab_categories else None,
+                adm_type=decision.adm_type or None,
+                has_media=decision.has_media,
+                vast_wrapper_depth=decision.vast_wrapper_depth,
+            )
+            session.add(log_entry)
+            # db.session() auto-commits on block exit
+    except Exception as exc:
+        logger.warning("Failed to persist AdDecision to DB: %s", exc)
+
+
 def _inject_tracking_into_adm(
     adm: str,
     impression_url: str,
     error_url: str,
-    tracking_events: list[TrackingEvent],
 ) -> str:
     """
-    Inject LiteAds tracking pixels into a DSP's VAST XML (adm).
+    Inject LiteAds impression + error pixels into a DSP's VAST XML (adm).
 
     **CTV double-impression prevention:**  An ``<Impression>`` tag is only
     injected when *impression_url* is non-empty.  When the caller passes
     an empty string the DSP's own ``<Impression>`` remains the single
     source of truth, avoiding double-fire on CTV players.
 
-    Tracking events (start, quartile, complete …) and ``<Error>`` are
-    always injected so that LiteAds can still measure video engagement.
+    Tracking events (start, quartile, complete …) are NOT injected —
+    they are provided solely by the demand/DSP response.
     """
     parts: list[str] = []
 
@@ -673,19 +851,6 @@ def _inject_tracking_into_adm(
 
     inject_block = "\n        ".join(parts)
     inject_block = f"\n        {inject_block}"
-
-    # Build tracking events XML block to inject into <Linear>
-    if tracking_events:
-        te_lines = ["<TrackingEvents>"]
-        for te in tracking_events:
-            te_lines.append(
-                f'              <Tracking event="{te.event}"><![CDATA[{te.url}]]></Tracking>'
-            )
-        te_lines.append("            </TrackingEvents>")
-        te_block = "\n            ".join(te_lines)
-        # Inject tracking events before </Linear>
-        if "</Linear>" in adm:
-            adm = adm.replace("</Linear>", f"  {te_block}\n          </Linear>", 1)
 
     # Try to insert impression/error after <InLine> or <Wrapper> opening tag
     for tag in ("<InLine>", "<Wrapper>"):

@@ -118,23 +118,11 @@ NO_BID_TOTAL = Counter(
     ["reason"],
 )
 
-BID_FLOOR_FILTERED_TOTAL = Counter(
-    "liteads_bid_floor_filtered_total",
-    "Candidates removed by bid floor",
-    ["slot_id"],
-)
-
 
 QUARTILE_FUNNEL = Counter(
     "liteads_quartile_funnel_total",
     "Video playback funnel (impression → start → Q1 → mid → Q3 → complete)",
     ["stage", "campaign_id"],
-)
-
-WIN_RATE = Histogram(
-    "liteads_win_rate",
-    "Auction win rate per request batch",
-    buckets=(0, 0.1, 0.25, 0.5, 0.75, 1.0),
 )
 
 
@@ -249,11 +237,6 @@ def record_ad_skip(campaign_id: str) -> None:
 def record_no_bid(reason: str = "no_fill") -> None:
     """Record a no-bid (no fill) response."""
     NO_BID_TOTAL.labels(reason=reason).inc()
-
-
-def record_bid_floor_filtered(slot_id: str, count: int = 1) -> None:
-    """Record candidates filtered by bid floor."""
-    BID_FLOOR_FILTERED_TOTAL.labels(slot_id=slot_id).inc(count)
 
 
 def record_quartile(stage: str, campaign_id: str) -> None:

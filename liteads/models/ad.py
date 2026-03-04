@@ -21,6 +21,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -246,6 +247,10 @@ class AdEvent(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     request_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    decision_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True,
+        comment="Ad decision ID for joining events to AdDecision records",
+    )
     campaign_id: Mapped[int | None] = mapped_column(
         Integer, nullable=True, index=True,
         comment="Campaign ID (NULL for external demand fills)",
@@ -360,6 +365,110 @@ class HourlyStat(Base):
     )
 
 
+class AdDecisionLog(Base):
+    """Persistent canonical record for each ad-serving decision.
+
+    Stores the full context of *why* an ad was shown, including supply context,
+    auction mechanics, creative identification (multi-source priority chain),
+    and adomain data.  The ``decision_id`` is the primary join key for
+    correlating downstream VAST events.
+    """
+
+    __tablename__ = "ad_decision_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    decision_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True,
+        comment="Unique decision ID — join key for VAST events",
+    )
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    imp_id: Mapped[str] = mapped_column(String(32), default="1")
+    bid_id: Mapped[str] = mapped_column(String(128), default="")
+
+    # Supply context
+    app_bundle: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    app_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    publisher_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    device_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    os: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    geo_country: Mapped[str | None] = mapped_column(String(3), nullable=True, index=True)
+    geo_region: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    supply_tag_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    # Auction
+    bid_floor: Mapped[Decimal] = mapped_column(Numeric(10, 4), default=Decimal("0"))
+    bid_price: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4), default=Decimal("0"),
+        comment="Original DSP bid price (CPM, pre-margin)",
+    )
+    net_price: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4), default=Decimal("0"),
+        comment="Net price after margin deduction",
+    )
+    seat: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    deal_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    demand_endpoint_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    demand_endpoint_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Creative identification
+    creative_id_resolved: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, index=True,
+        comment="Best-available creative ID after priority chain resolution",
+    )
+    creative_id_source: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+        comment="Source: crid | adid | vast_creative | vast_ad | hash",
+    )
+    crid: Mapped[str | None] = mapped_column(String(255), nullable=True, comment="OpenRTB crid")
+    adid: Mapped[str | None] = mapped_column(String(255), nullable=True, comment="OpenRTB adid")
+    vast_creative_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment="VAST <Creative id>",
+    )
+    vast_ad_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment="VAST <Ad id>",
+    )
+    duration: Mapped[int] = mapped_column(Integer, default=0)
+    width: Mapped[int] = mapped_column(Integer, default=0)
+    height: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Adomain
+    adomain_list: Mapped[list[str] | None] = mapped_column(
+        JSON, nullable=True, comment="Full adomain list from bid.adomain[]",
+    )
+    adomain_primary: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, index=True,
+        comment="Primary adomain for reporting",
+    )
+    adomain_source: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+        comment="Source: ortb | clickthrough | ext | (empty)",
+    )
+    iab_categories: Mapped[list[str] | None] = mapped_column(
+        JSON, nullable=True, comment="IAB content categories from bid.cat[]",
+    )
+
+    # Markup / VAST
+    adm_type: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+        comment="inline | wrapper | nurl | vast_tag",
+    )
+    has_media: Mapped[bool] = mapped_column(Boolean, default=False)
+    vast_wrapper_depth: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Timestamp
+    decision_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_decision_log_req_imp", "request_id", "imp_id"),
+        Index("ix_decision_log_adomain_time", "adomain_primary", "decision_time"),
+        Index("ix_decision_log_creative_time", "creative_id_resolved", "decision_time"),
+    )
+
+
 # =========================================================================
 # Supply / Demand management models
 # =========================================================================
@@ -382,7 +491,17 @@ class SupplyTag(Base, TimestampMixin):
         comment="Unique slot/zone identifier used in VAST tag URL",
     )
 
+    # Integration type: tag=Tag based, ortb=Open RTB, prebid=Prebid
+    integration_type: Mapped[str] = mapped_column(
+        String(16), default="tag",
+        comment="Integration type: tag | ortb | prebid",
+    )
+
     # Pricing
+    pricing_type: Mapped[str] = mapped_column(
+        String(16), default="floor",
+        comment="Pricing type: fixed_cpm | revshare | floor",
+    )
     bid_floor: Mapped[Decimal] = mapped_column(
         Numeric(10, 4), default=Decimal("0"),
         comment="Minimum CPM floor price for this supply tag",
@@ -390,6 +509,14 @@ class SupplyTag(Base, TimestampMixin):
     margin_pct: Mapped[Decimal] = mapped_column(
         Numeric(6, 2), default=Decimal("0"),
         comment="Margin percentage the ad server takes (e.g. 20.00 = 20%)",
+    )
+    revshare_pct: Mapped[Decimal] = mapped_column(
+        Numeric(6, 2), default=Decimal("80"),
+        comment="Revenue share % publisher keeps (e.g. 80 = 80%)",
+    )
+    fixed_cpm: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4), default=Decimal("0"),
+        comment="Fixed CPM payout to publisher",
     )
 
     # Video settings
@@ -401,6 +528,9 @@ class SupplyTag(Base, TimestampMixin):
     max_duration: Mapped[int] = mapped_column(Integer, default=30)
     width: Mapped[int] = mapped_column(Integer, default=1920)
     height: Mapped[int] = mapped_column(Integer, default=1080)
+
+    # Sensitive supply flag
+    sensitive: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Status
     status: Mapped[int] = mapped_column(Integer, default=Status.ACTIVE)
@@ -428,6 +558,12 @@ class DemandEndpoint(Base, TimestampMixin):
         comment="Full URL for OpenRTB 2.6 bid requests",
     )
 
+    # Integration type: tag=Tag based, ortb=Open RTB, prebid=Prebid server
+    integration_type: Mapped[str] = mapped_column(
+        String(16), default="ortb",
+        comment="Integration type: tag | ortb | direct | prebid",
+    )
+
     # Pricing
     bid_floor: Mapped[Decimal] = mapped_column(
         Numeric(10, 4), default=Decimal("0"),
@@ -446,6 +582,35 @@ class DemandEndpoint(Base, TimestampMixin):
     qps_limit: Mapped[int] = mapped_column(
         Integer, default=0,
         comment="Max queries per second (0 = unlimited)",
+    )
+
+    # OpenRTB settings
+    ortb_version: Mapped[str] = mapped_column(
+        String(16), default="2.6",
+        comment="OpenRTB version: 2.5 | 2.6",
+    )
+    auction_type: Mapped[int] = mapped_column(
+        Integer, default=1,
+        comment="1=First Price, 2=Second Price",
+    )
+    mime_types: Mapped[list[str] | None] = mapped_column(
+        JSON, nullable=True, default=None,
+        comment="Supported MIME types e.g. [video/mp4, video/webm]",
+    )
+    protocols: Mapped[list[int] | None] = mapped_column(
+        JSON, nullable=True, default=None,
+        comment="Supported VAST protocols: 2=VAST2, 3=VAST3, 5=VAST2Wrapper, etc.",
+    )
+    demand_type: Mapped[str] = mapped_column(
+        String(16), default="video",
+        comment="Demand type: video | display | audio",
+    )
+    sensitive: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Regional endpoints (JSON)
+    regional_urls: Mapped[dict[str, str] | None] = mapped_column(
+        JSON, nullable=True, default=None,
+        comment="Regional bid URLs: {us_east: url, us_west: url, europe: url}",
     )
 
     # Status

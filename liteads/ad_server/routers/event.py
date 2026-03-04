@@ -137,7 +137,6 @@ async def track_event(
 @router.get("/track")
 async def track_event_get(
     request: Request,
-    background_tasks: BackgroundTasks,
     type: str = Query(..., alias="type", description="VAST event type"),
     req: str = Query(..., description="Request ID"),
     ad: str = Query(..., description="Ad ID"),
@@ -150,6 +149,9 @@ async def track_event_get(
     bnd: str | None = Query(None, description="App bundle ID"),
     cc: str | None = Query(None, description="Country code"),
     bp: str | None = Query(None, description="Bid price (CPM)"),
+    sid: str | None = Query(None, description="Supply Placement ID"),
+    cmp: str | None = Query(None, description="Campaign ID"),
+    did: str | None = Query(None, description="Decision ID for event joining"),
     x_forwarded_for: str | None = Header(None, alias="X-Forwarded-For"),
     x_real_ip: str | None = Header(None, alias="X-Real-IP"),
     event_service: EventService = Depends(get_event_service),
@@ -170,9 +172,16 @@ async def track_event_get(
 
     logger.info("Pixel video event received", environment=env, error_code=err)
 
-    extra = None
+    extra = {}
     if err and err != "[ERRORCODE]":
-        extra = {"error_code": err}
+        extra["error_code"] = err
+    if sid:
+        extra["supply_id"] = sid
+    if cmp:
+        extra["campaign_id"] = cmp
+
+    if not extra:
+        extra = None
 
     client_ip = extract_client_ip(x_forwarded_for, request.client.host if request.client else None, x_real_ip)
 
@@ -186,8 +195,7 @@ async def track_event_get(
 
     # Schedule tracking in background — return pixel immediately.
     # FastAPI keeps the dependency (session) alive until background tasks finish.
-    background_tasks.add_task(
-        event_service.track_event,
+    await event_service.track_event(
         request_id=req,
         ad_id=ad,
         event_type=type,
@@ -202,6 +210,7 @@ async def track_event_get(
         bundle_id=bnd,
         country_code=cc,
         win_price=_win_price,
+        decision_id=did,
     )
 
     # Return 1x1 pixel immediately — players don't wait for tracking.
@@ -211,7 +220,6 @@ async def track_event_get(
 @router.get("/win")
 async def win_notification(
     request: Request,
-    background_tasks: BackgroundTasks,
     req: str = Query(..., description="Request ID"),
     ad: str = Query(..., description="Ad ID"),
     price: str = Query("0", description="Auction clearing price (CPM)"),
@@ -243,8 +251,7 @@ async def win_notification(
 
     client_ip = extract_client_ip(x_forwarded_for, request.client.host if request.client else None, x_real_ip)
 
-    background_tasks.add_task(
-        event_service.track_event,
+    await event_service.track_event(
         request_id=req,
         ad_id=ad,
         event_type="win",
@@ -263,7 +270,6 @@ async def win_notification(
 @router.get("/loss")
 async def loss_notification(
     request: Request,
-    background_tasks: BackgroundTasks,
     req: str = Query(..., description="Request ID"),
     ad: str = Query(..., description="Ad ID"),
     reason: str = Query("0", description="Loss reason code (OpenRTB Table 5.25)"),
@@ -309,8 +315,7 @@ async def loss_notification(
 
     client_ip = extract_client_ip(x_forwarded_for, request.client.host if request.client else None, x_real_ip)
 
-    background_tasks.add_task(
-        event_service.track_event,
+    await event_service.track_event(
         request_id=req,
         ad_id=ad,
         event_type="loss",
@@ -332,7 +337,6 @@ async def loss_notification(
 @router.get("/billing")
 async def billing_notification(
     request: Request,
-    background_tasks: BackgroundTasks,
     req: str = Query(..., description="Request ID"),
     ad: str = Query(..., description="Ad ID"),
     price: str = Query("0", description="Billable price (CPM)"),
@@ -361,8 +365,7 @@ async def billing_notification(
 
     client_ip = extract_client_ip(x_forwarded_for, request.client.host if request.client else None, x_real_ip)
 
-    background_tasks.add_task(
-        event_service.track_event,
+    await event_service.track_event(
         request_id=req,
         ad_id=ad,
         event_type="impression",

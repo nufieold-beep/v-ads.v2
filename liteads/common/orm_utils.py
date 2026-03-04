@@ -28,9 +28,22 @@ async def get_or_404(session: AsyncSession, model: type[_T], entity_id: int, lab
 
 
 def apply_updates(obj: Any, updates: BaseModel) -> None:
-    """Apply non-None fields from a Pydantic update model onto an ORM object."""
-    for field_name, value in updates.model_dump(exclude_unset=True).items():
+    """Apply non-None fields from a Pydantic update model onto an ORM object.
+
+    Fields explicitly set to ``None`` by the caller (i.e. present in the
+    JSON payload with value ``null``) are applied as-is — this allows
+    clearing nullable columns such as JSON fields (mime_types, regional_urls).
+    Fields that were *not sent at all* are excluded by ``exclude_unset``.
+    """
+    data = updates.model_dump(exclude_unset=True)
+    # Fields that the caller explicitly set (may include None)
+    explicitly_set = updates.model_fields_set
+
+    for field_name, value in data.items():
         if value is not None:
             if isinstance(value, float):
                 value = Decimal(str(value))
             setattr(obj, field_name, value)
+        elif field_name in explicitly_set:
+            # Caller explicitly sent null — clear the column
+            setattr(obj, field_name, None)

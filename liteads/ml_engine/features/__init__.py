@@ -12,6 +12,7 @@ from liteads.ml_engine.features.config import (
 )
 from liteads.ml_engine.features.processor import (
     BaseFeatureProcessor,
+    CategoricalFeatureProcessor,
     ContinuousFeatureProcessor,
     CrossFeatureProcessor,
     DiscreteFeatureProcessor,
@@ -31,6 +32,7 @@ __all__ = [
     "get_feature_config",
     # Processors
     "BaseFeatureProcessor",
+    "CategoricalFeatureProcessor",
     "IDFeatureProcessor",
     "DiscreteFeatureProcessor",
     "ContinuousFeatureProcessor",

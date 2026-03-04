@@ -19,48 +19,33 @@ from __future__ import annotations
 import uuid
 from typing import Any, Optional
 
-from liteads.common.logger import get_logger
 from liteads.common.geoip import geoip_to_ortb_geo
+from liteads.common.logger import get_logger
+from liteads.common.ortb_defaults import (
+    DEFAULT_AUCTION_TYPE,
+    DEFAULT_BID_FLOOR,
+    DEFAULT_LANGUAGE,
+    DEFAULT_TMAX,
+    ENRICHER_DEVICE_DEFAULTS,
+    ENRICHER_VIDEO_DEFAULTS,
+    default_connection_type,
+)
 from liteads.schemas.openrtb import (
     App as OrtbApp,
+    Content as OrtbContent,
     Device as OrtbDevice,
     Publisher as OrtbPublisher,
     Regs as OrtbRegs,
     Source as OrtbSource,
     Video as OrtbVideo,
-    Content as OrtbContent,
 )
 
 logger = get_logger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Default values matching the canonical schema
-# ─────────────────────────────────────────────────────────────────────────────
-
-_DEFAULTS_VIDEO = {
-    "mimes": ["video/mp4", "video/webm", "application/javascript"],
-    "protocols": [2, 3, 4, 5, 6, 7, 8],
-    "w": 1920,
-    "h": 1080,
-    "plcmt": 1,
-    "placement": 1,
-    "pos": 1,
-    "hwv": 1,
-    "linearity": 1,
-    "startdelay": 0,
-    "minduration": 3,
-    "maxduration": 30,
-    "playbackmethod": [1],
-    "delivery": [2],
-}
-
-_DEFAULTS_DEVICE = {
-    "devicetype": 3,
-    "lmt": 0,
-    "dnt": 0,
-    "language": "en",
-}
+# Defaults now imported from liteads.common.ortb_defaults
+_DEFAULTS_VIDEO = ENRICHER_VIDEO_DEFAULTS
+_DEFAULTS_DEVICE = ENRICHER_DEVICE_DEFAULTS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,10 +94,10 @@ def enrich_bid_request(
         br.id = f"REQ-{uuid.uuid4().hex[:12]}"
         enriched_fields.append("id")
 
-    if _set_default(br, "at", 1):
+    if _set_default(br, "at", DEFAULT_AUCTION_TYPE):
         enriched_fields.append("at")
 
-    if _set_default(br, "tmax", 500):
+    if _set_default(br, "tmax", DEFAULT_TMAX):
         enriched_fields.append("tmax")
 
     # ── 2. Impression + Video ───────────────────────────────────
@@ -129,7 +114,7 @@ def enrich_bid_request(
         # and the target (good) SSP format does not include tagid.
 
         if imp.bidfloor is None:
-            imp.bidfloor = 0.01  # minimal floor — let DSP decide
+            imp.bidfloor = DEFAULT_BID_FLOOR
             enriched_fields.append("imp.bidfloor")
 
         # secure (HTTPS) — always 1 for video
@@ -180,8 +165,8 @@ def enrich_bid_request(
 
         # connectiontype: CTV → Ethernet (1), others → WiFi (2)
         if dev.connectiontype is None:
-            env = "ctv" if dev.devicetype in (3, 7) else "inapp"
-            dev.connectiontype = 1 if env == "ctv" else 2
+            _dev_is_ctv = dev.devicetype in (3, 7)
+            dev.connectiontype = default_connection_type(_dev_is_ctv)
             enriched_fields.append("device.connectiontype")
 
         # Generate basic SUA for CTV if missing (DSP anti-fraud requirement)
@@ -219,7 +204,7 @@ def enrich_bid_request(
 
         # Content for CTV
         if _is_ctv and app.content is None:
-            app.content = OrtbContent(livestream=0, language=getattr(br.device, "language", "en") or "en")
+            app.content = OrtbContent(livestream=0, language=getattr(br.device, "language", DEFAULT_LANGUAGE) or DEFAULT_LANGUAGE)
             enriched_fields.append("app.content (created)")
 
     # ── 6. Source — only fill fd/tid if completely missing ─────────────

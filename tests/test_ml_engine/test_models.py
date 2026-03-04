@@ -1,11 +1,11 @@
 """
-Tests for ML models.
+Tests for ML models and reusable layers.
 """
 
 import pytest
 import torch
 
-from liteads.ml_engine.models.deepfm import DeepFM, MultiTaskDeepFM
+from liteads.ml_engine.models.deepfm import DeepFM
 from liteads.ml_engine.models.layers import DNN, FM, EmbeddingLayer, SequenceEmbeddingLayer
 
 
@@ -159,11 +159,12 @@ class TestDeepFM:
 
         outputs = model(sparse_features, dense_features)
 
-        assert "task_0" in outputs
-        assert outputs["task_0"].shape == (batch_size, 1)
+        assert "ctr" in outputs
+        ctr = outputs["ctr"]
+        assert ctr.shape == (batch_size,)
         # Output should be probabilities
-        assert (outputs["task_0"] >= 0).all()
-        assert (outputs["task_0"] <= 1).all()
+        assert (ctr >= 0).all()
+        assert (ctr <= 1).all()
 
     def test_without_dense(self) -> None:
         """Test DeepFM without dense features."""
@@ -178,40 +179,7 @@ class TestDeepFM:
 
         outputs = model(sparse_features, None)
 
-        assert outputs["task_0"].shape == (16, 1)
-
-    def test_without_fm(self) -> None:
-        """Test DeepFM without FM component."""
-        model = DeepFM(
-            sparse_feature_dims=[100],
-            sparse_embedding_dims=8,
-            dense_feature_dim=3,
-            use_fm=False,
-            dnn_hidden_units=[32],
-        )
-
-        sparse_features = torch.randint(0, 50, (16, 1))
-        dense_features = torch.randn(16, 3)
-
-        outputs = model(sparse_features, dense_features)
-
-        assert outputs["task_0"].shape == (16, 1)
-
-    def test_without_dnn(self) -> None:
-        """Test DeepFM without DNN component (FM only)."""
-        model = DeepFM(
-            sparse_feature_dims=[100, 50],
-            sparse_embedding_dims=8,
-            dense_feature_dim=2,
-            use_dnn=False,
-        )
-
-        sparse_features = torch.randint(0, 50, (16, 2))
-        dense_features = torch.randn(16, 2)
-
-        outputs = model(sparse_features, dense_features)
-
-        assert outputs["task_0"].shape == (16, 1)
+        assert outputs["ctr"].shape == (16,)
 
     def test_regularization_loss(self, model: DeepFM) -> None:
         """Test regularization loss calculation."""
@@ -229,55 +197,10 @@ class TestDeepFM:
         dense_features = torch.randn(8, 5)
 
         outputs = model(sparse_features, dense_features)
-        loss = outputs["task_0"].mean()
+        loss = outputs["ctr"].mean()
         loss.backward()
 
         # Check gradients exist
         for param in model.parameters():
             if param.requires_grad:
                 assert param.grad is not None
-
-
-class TestMultiTaskDeepFM:
-    """Tests for multi-task DeepFM model."""
-
-    def test_forward(self) -> None:
-        """Test multi-task forward pass."""
-        model = MultiTaskDeepFM(
-            sparse_feature_dims=[100, 50],
-            sparse_embedding_dims=8,
-            dense_feature_dim=3,
-            dnn_hidden_units=[32, 16],
-        )
-
-        batch_size = 16
-        sparse_features = torch.randint(0, 50, (batch_size, 2))
-        dense_features = torch.randn(batch_size, 3)
-
-        outputs = model(sparse_features, dense_features)
-
-        # Should have CTR, CVR, and CTCVR outputs
-        assert "ctr" in outputs
-        assert "cvr" in outputs
-        assert "ctcvr" in outputs
-
-        # CTCVR = CTR * CVR
-        expected_ctcvr = outputs["ctr"] * outputs["cvr"]
-        torch.testing.assert_close(outputs["ctcvr"], expected_ctcvr)
-
-    def test_outputs_are_probabilities(self) -> None:
-        """Test all outputs are valid probabilities."""
-        model = MultiTaskDeepFM(
-            sparse_feature_dims=[100],
-            sparse_embedding_dims=8,
-            dense_feature_dim=2,
-        )
-
-        sparse_features = torch.randint(0, 50, (32, 1))
-        dense_features = torch.randn(32, 2)
-
-        outputs = model(sparse_features, dense_features)
-
-        for name, output in outputs.items():
-            assert (output >= 0).all(), f"{name} has negative values"
-            assert (output <= 1).all(), f"{name} has values > 1"

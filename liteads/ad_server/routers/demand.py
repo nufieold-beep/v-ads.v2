@@ -349,7 +349,7 @@ class IntegrationEndpointsOut(BaseModel):
 # ============================================================================
 
 _ENV_LABELS = {1: "CTV", 2: "In-App", None: "All"}
-_STATUS_LABELS = {0: "Inactive", 1: "Active", 2: "Paused", 3: "Deleted"}
+_STATUS_LABELS = {0: "Inactive", 1: "Active", 2: "Paused"}
 _CREATIVE_TYPE_LABELS = {1: "CTV Video", 2: "In-App Video"}
 _PLACEMENT_LABELS = {1: "Pre-Roll", 2: "Mid-Roll", 3: "Post-Roll"}
 
@@ -745,7 +745,7 @@ async def list_creatives(
     await _verify_campaign_owner(session, camp_id, advertiser_id)
     result = await session.execute(
         select(Creative)
-        .where(Creative.campaign_id == camp_id, Creative.status != ModelStatus.DELETED)
+        .where(Creative.campaign_id == camp_id)
         .order_by(Creative.id)
     )
     return [_enrich_creative(c) for c in result.scalars().all()]
@@ -789,7 +789,7 @@ async def delete_creative(
     campaign = await get_or_404(session, Campaign, creative.campaign_id, "Campaign")
     if campaign.advertiser_id != advertiser_id:
         raise HTTPException(status_code=403, detail="Creative does not belong to this advertiser")
-    creative.status = ModelStatus.DELETED
+    await session.delete(creative)
     await session.flush()
     logger.info("Demand creative deleted", creative_id=creative_id)
 

@@ -2,6 +2,7 @@
 Analytics & Reporting Router – Campaign performance, demand & supply reports.
 
 Endpoints:
+    GET  /overview                     – Global demand overview (today)
     GET  /campaigns                    – All campaigns summary
     GET  /campaign/{id}/realtime       – Current-hour live stats
     GET  /campaign/{id}/today          – Today aggregate stats
@@ -79,6 +80,25 @@ def _get_analytics_service(
     session: AsyncSession = Depends(get_session),
 ) -> AnalyticsService:
     return AnalyticsService(session)
+
+
+# ---------------------------------------------------------------------------
+# Global overview
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/overview",
+    summary="Global demand overview (today)",
+    description=(
+        "Returns today's aggregate demand stats from the global Redis bucket "
+        "(campaign_id=0). Includes ad_requests, ad_opportunities, wins, "
+        "impressions, spend, fill_rate, vtr, and derived eCPM metrics."
+    ),
+)
+async def global_overview(
+    service: AnalyticsService = Depends(_get_analytics_service),
+) -> dict[str, Any]:
+    return await service.get_global_overview()
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +226,50 @@ async def supply_report(
 
 
 # ---------------------------------------------------------------------------
+# Creative-level & Decision analytics (AdDecision-enriched)
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/reports/creative",
+    summary="Creative-level analytics",
+    description=(
+        "Returns per-creative rollups using the AdDecision join: "
+        "impressions, starts, completions, render rate, completion rate, "
+        "eCPM.  Creative IDs are resolved via the multi-source priority "
+        "chain (crid → adid → VAST Creative@id → VAST Ad@id → hash)."
+    ),
+)
+async def creative_report(
+    start: str | None = Query(None, description="Start datetime ISO-8601"),
+    end: str | None = Query(None, description="End datetime ISO-8601"),
+    service: AnalyticsService = Depends(_get_analytics_service),
+) -> list[dict[str, Any]]:
+    start_dt = parse_optional_iso_datetime(start)
+    end_dt = parse_optional_iso_datetime(end)
+    return await service.get_creative_report(start_dt, end_dt)
+
+
+@router.get(
+    "/reports/decisions",
+    summary="Recent ad decisions",
+    description=(
+        "Returns the most recent AdDecisionLog entries showing the full "
+        "creative ID resolution chain, adomain extraction, and markup type. "
+        "Useful for debugging and auditing ad decision quality."
+    ),
+)
+async def decision_summary(
+    start: str | None = Query(None, description="Start datetime ISO-8601"),
+    end: str | None = Query(None, description="End datetime ISO-8601"),
+    limit: int = Query(100, ge=1, le=1000, description="Max rows to return"),
+    service: AnalyticsService = Depends(_get_analytics_service),
+) -> list[dict[str, Any]]:
+    start_dt = parse_optional_iso_datetime(start)
+    end_dt = parse_optional_iso_datetime(end)
+    return await service.get_decision_summary(start_dt, end_dt, limit)
+
+
+# ---------------------------------------------------------------------------
 # Delivery Health & VAST Error reports
 # ---------------------------------------------------------------------------
 
@@ -330,3 +394,60 @@ async def sync_spend(
 ) -> dict[str, Any]:
     updated = await service.sync_campaign_spend_to_db()
     return {"updated_campaigns": updated}
+
+
+# ---------------------------------------------------------------------------
+# Live ORTB/VAST Traffic Capture (for dashboard integration)
+# ---------------------------------------------------------------------------
+
+import collections
+import time as _time
+
+# In-memory ring buffer for recent ORTB/VAST traffic (last 200 entries)
+_TRAFFIC_BUFFER: collections.deque = collections.deque(maxlen=200)
+
+
+def capture_traffic_event(
+    event_type: str,
+    request_id: str,
+    data: dict[str, Any],
+) -> None:
+    """Capture an ORTB/VAST traffic event into the ring buffer.
+
+    Called from openrtb.py and vast_tag.py routers to log
+    bid requests, bid responses, and VAST tag requests for
+    live dashboard monitoring.
+    """
+    _TRAFFIC_BUFFER.append({
+        "ts": _time.time(),
+        "type": event_type,
+        "request_id": request_id,
+        **data,
+    })
+
+
+@router.get(
+    "/traffic/live",
+    summary="Live ORTB/VAST traffic stream",
+    description=(
+        "Returns the most recent ORTB bid requests, bid responses, and VAST tag "
+        "requests from the in-memory ring buffer. Used by the dashboard for "
+        "real-time traffic monitoring and ORTB/VAST integration view."
+    ),
+)
+async def live_traffic(
+    limit: int = Query(50, description="Max entries to return", le=200),
+    event_type: str | None = Query(None, description="Filter: ortb_request, ortb_response, vast_request"),
+) -> dict[str, Any]:
+    entries = list(_TRAFFIC_BUFFER)
+    entries.reverse()  # newest first
+
+    if event_type:
+        entries = [e for e in entries if e.get("type") == event_type]
+
+    entries = entries[:limit]
+    return {
+        "entries": entries,
+        "total_buffered": len(_TRAFFIC_BUFFER),
+        "limit": limit,
+    }

@@ -32,7 +32,6 @@ class Status(IntEnum):
     INACTIVE = 0
     ACTIVE = 1
     PAUSED = 2
-    DELETED = 3
     PENDING = 4
 
 

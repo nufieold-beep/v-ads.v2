@@ -18,13 +18,13 @@ Endpoints:
         GET    /api/v1/admin/campaigns/{id}             – Get campaign + creatives
         PUT    /api/v1/admin/campaigns/{id}             – Update campaign
         PATCH  /api/v1/admin/campaigns/{id}/status      – Pause / resume / archive
-        DELETE /api/v1/admin/campaigns/{id}             – Soft-delete campaign
+        DELETE /api/v1/admin/campaigns/{id}             – Delete campaign
 
     CREATIVES
         POST   /api/v1/admin/creatives                  – Add creative to campaign
         GET    /api/v1/admin/creatives/{id}             – Get creative
         PUT    /api/v1/admin/creatives/{id}             – Update creative
-        DELETE /api/v1/admin/creatives/{id}             – Soft-delete creative
+        DELETE /api/v1/admin/creatives/{id}             – Delete creative
 
     TARGETING
         POST   /api/v1/admin/campaigns/{id}/targeting   – Add targeting rule
@@ -78,7 +78,7 @@ class AdvertiserUpdate(BaseModel):
     contact_email: str | None = None
     balance: float | None = None
     daily_budget: float | None = None
-    status: int | None = Field(None, description="0=inactive, 1=active, 2=paused, 3=deleted")
+    status: int | None = Field(None, description="0=inactive, 1=active, 2=paused")
 
 
 class AdvertiserOut(BaseModel):
@@ -134,7 +134,7 @@ class CampaignUpdate(BaseModel):
 
 
 class CampaignStatusUpdate(BaseModel):
-    status: int = Field(..., description="0=inactive, 1=active, 2=paused, 3=deleted")
+    status: int = Field(..., description="0=inactive, 1=active, 2=paused")
 
 
 class CampaignOut(BaseModel):
@@ -309,12 +309,12 @@ async def update_advertiser(
     return adv
 
 
-@router.delete("/advertisers/{adv_id}", status_code=204, summary="Soft-delete advertiser")
+@router.delete("/advertisers/{adv_id}", status_code=204, summary="Delete advertiser")
 async def delete_advertiser(adv_id: int, session: AsyncSession = Depends(get_session)) -> None:
     adv = await get_or_404(session, Advertiser, adv_id, "Advertiser")
-    adv.status = ModelStatus.DELETED
+    await session.delete(adv)
     await session.flush()
-    logger.info("Advertiser soft-deleted", advertiser_id=adv_id)
+    logger.info("Advertiser deleted", advertiser_id=adv_id)
 
 
 # ============================================================================
@@ -407,12 +407,12 @@ async def update_campaign_status(
     return campaign
 
 
-@router.delete("/campaigns/{camp_id}", status_code=204, summary="Soft-delete campaign")
+@router.delete("/campaigns/{camp_id}", status_code=204, summary="Delete campaign")
 async def delete_campaign(camp_id: int, session: AsyncSession = Depends(get_session)) -> None:
     campaign = await get_or_404(session, Campaign, camp_id, "Campaign")
-    campaign.status = ModelStatus.DELETED
+    await session.delete(campaign)
     await session.flush()
-    logger.info("Campaign soft-deleted", campaign_id=camp_id)
+    logger.info("Campaign deleted", campaign_id=camp_id)
 
 
 # ============================================================================
@@ -496,14 +496,14 @@ async def update_creative(
     return creative
 
 
-@router.delete("/creatives/{creative_id}", status_code=204, summary="Soft-delete creative")
+@router.delete("/creatives/{creative_id}", status_code=204, summary="Delete creative")
 async def delete_creative(
     creative_id: int, session: AsyncSession = Depends(get_session)
 ) -> None:
     creative = await get_or_404(session, Creative, creative_id, "Creative")
-    creative.status = ModelStatus.DELETED
+    await session.delete(creative)
     await session.flush()
-    logger.info("Creative soft-deleted", creative_id=creative_id)
+    logger.info("Creative deleted", creative_id=creative_id)
 
 
 # ============================================================================

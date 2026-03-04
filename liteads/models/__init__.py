@@ -3,6 +3,7 @@ Database models for LiteAds — CPM CTV & In-App Video Ad Serving.
 """
 
 from liteads.models.ad import (
+    AdDecisionLog,
     AdEvent,
     Advertiser,
     Campaign,
@@ -43,6 +44,7 @@ __all__ = [
     "TargetingRule",
     "HourlyStat",
     "AdEvent",
+    "AdDecisionLog",
     # Supply / Demand
     "SupplyTag",
     "DemandEndpoint",

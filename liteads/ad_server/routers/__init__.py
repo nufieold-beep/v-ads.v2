@@ -10,3 +10,5 @@ Modules:
     openrtb   – OpenRTB 2.6 bid endpoint
     vast_tag  – VAST tag GET endpoint + publisher tag builder
 """
+
+from . import settings

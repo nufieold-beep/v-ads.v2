@@ -23,6 +23,7 @@ from liteads.ad_server.services.ad_service import AdService
 from liteads.ad_server.services.event_service import EventService
 from liteads.ad_server.services.openrtb_service import OpenRTBService
 from liteads.ad_server.middleware.metrics import record_no_bid
+from liteads.ad_server.routers.analytics import capture_traffic_event
 from liteads.common.database import get_session
 from liteads.common.logger import get_logger
 from liteads.common.ortb_enricher import enrich_bid_request
@@ -129,6 +130,16 @@ async def openrtb_bid(
         user_agent=user_agent,
     )
 
+    # ── Capture inbound ORTB request for live traffic inspector ──
+    capture_traffic_event("ortb_request", bid_request.id, {
+        "environment": bid_request.environment,
+        "tmax": bid_request.tmax,
+        "imp_count": len(bid_request.imp),
+        "device_type": getattr(bid_request.device, "devicetype", None) if bid_request.device else None,
+        "client_ip": client_ip,
+        "user_agent": user_agent,
+    })
+
     # Validate that we have at least one video impression
     has_video = any(imp.video is not None for imp in bid_request.imp)
     if not has_video:
@@ -188,6 +199,17 @@ async def openrtb_bid(
         )
 
     processing_ms = (time.monotonic() - start_time) * 1000
+
+    # ── Capture outbound ORTB response for live traffic inspector ──
+    capture_traffic_event("ortb_response", bid_request.id, {
+        "environment": bid_request.environment,
+        "num_bids": sum(len(sb.bid) for sb in bid_response.seatbid),
+        "processing_ms": round(processing_ms, 2),
+        "bids": [
+            {"impid": b.impid, "price": float(b.price), "cid": b.cid, "w": b.w, "h": b.h}
+            for sb in bid_response.seatbid for b in sb.bid
+        ],
+    })
 
     logger.info(
         "OpenRTB bid response",

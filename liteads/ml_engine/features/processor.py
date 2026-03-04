@@ -66,11 +66,13 @@ class BaseFeatureProcessor(ABC):
 # ==============================================================================
 
 
-class IDFeatureProcessor(BaseFeatureProcessor):
+class CategoricalFeatureProcessor(BaseFeatureProcessor):
     """
-    ID Feature Processor.
+    Categorical Feature Processor.
 
-    Encodes ID features using LabelEncoder for embedding lookup.
+    Encodes categorical (ID or discrete) features using LabelEncoder.
+    Subclass and override ``get_output_dim`` to control whether the
+    processor returns an embedding dimension or a single encoded value.
     """
 
     def __init__(self, config: FeatureConfig):
@@ -78,7 +80,7 @@ class IDFeatureProcessor(BaseFeatureProcessor):
         self.encoder = LabelEncoder()
         self.unknown_idx = 0  # Index for unknown values
 
-    def fit(self, data: pd.Series) -> "IDFeatureProcessor":
+    def fit(self, data: pd.Series) -> "CategoricalFeatureProcessor":
         # Fill NA and convert to string
         data_clean = data.fillna("__UNKNOWN__").astype(str)
 
@@ -96,7 +98,7 @@ class IDFeatureProcessor(BaseFeatureProcessor):
 
         self.is_fitted = True
         logger.debug(
-            f"IDFeatureProcessor fitted: {self.name}, "
+            f"{type(self).__name__} fitted: {self.name}, "
             f"vocab_size={len(self.encoder.classes_)}"
         )
         return self
@@ -122,55 +124,18 @@ class IDFeatureProcessor(BaseFeatureProcessor):
         return len(self.encoder.classes_)
 
 
-class DiscreteFeatureProcessor(BaseFeatureProcessor):
-    """
-    Discrete Feature Processor.
+class IDFeatureProcessor(CategoricalFeatureProcessor):
+    """ID feature processor — output dim equals embedding_dim (default 16)."""
 
-    Encodes discrete features using LabelEncoder.
-    """
+    def get_output_dim(self) -> int:
+        return self.config.embedding_dim or 16
 
-    def __init__(self, config: FeatureConfig):
-        super().__init__(config)
-        self.encoder = LabelEncoder()
-        self.unknown_idx = 0
 
-    def fit(self, data: pd.Series) -> "DiscreteFeatureProcessor":
-        data_clean = data.fillna("__UNKNOWN__").astype(str)
-        self.encoder.fit(data_clean)
-
-        if "__UNKNOWN__" not in self.encoder.classes_:
-            self.encoder.classes_ = np.append(
-                self.encoder.classes_, "__UNKNOWN__"
-            )
-        self.unknown_idx = np.where(
-            self.encoder.classes_ == "__UNKNOWN__"
-        )[0][0]
-
-        self.is_fitted = True
-        logger.debug(
-            f"DiscreteFeatureProcessor fitted: {self.name}, "
-            f"vocab_size={len(self.encoder.classes_)}"
-        )
-        return self
-
-    def transform(self, data: pd.Series) -> np.ndarray:
-        if not self.is_fitted:
-            raise RuntimeError(f"Processor {self.name} not fitted")
-
-        data_clean = data.fillna("__UNKNOWN__").astype(str)
-
-        result = np.full(len(data_clean), self.unknown_idx, dtype=np.int64)
-        known_mask = data_clean.isin(self.encoder.classes_)
-        if known_mask.any():
-            result[known_mask] = self.encoder.transform(data_clean[known_mask])
-
-        return result
+class DiscreteFeatureProcessor(CategoricalFeatureProcessor):
+    """Discrete feature processor — output dim is always 1."""
 
     def get_output_dim(self) -> int:
         return 1  # Single encoded value
-
-    def get_vocab_size(self) -> int:
-        return len(self.encoder.classes_)
 
 
 class ContinuousFeatureProcessor(BaseFeatureProcessor):

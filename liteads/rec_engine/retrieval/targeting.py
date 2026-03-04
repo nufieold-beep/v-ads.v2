@@ -10,6 +10,7 @@ Retrieves video ads based on targeting rules matching CTV/In-App user attributes
 """
 
 from typing import Any
+import time
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +23,10 @@ from liteads.rec_engine.retrieval.base import BaseRetrieval
 from liteads.schemas.internal import AdCandidate, UserContext
 
 logger = get_logger(__name__)
+
+# Two-tier cache configuration for active campaigns
+_LOCAL_CAMPAIGN_CACHE_TTL = 15.0
+_local_campaign_cache: tuple[float, list[dict[str, Any]]] | None = None
 
 # IAB CTV device OS taxonomy
 CTV_OS_FAMILY = {
@@ -148,12 +153,24 @@ class TargetingRetrieval(BaseRetrieval):
 
     async def _get_active_campaigns(self) -> list[dict[str, Any]]:
         """Get all active CPM campaigns with video creatives."""
+        global _local_campaign_cache
+        now = time.monotonic()
+        
+        # 1. Tier-one cache: Local memory
+        if _local_campaign_cache is not None:
+            ts, cached_data = _local_campaign_cache
+            if now - ts < _LOCAL_CAMPAIGN_CACHE_TTL:
+                return cached_data
+
+        # 2. Tier-two cache: Redis
         cache_key = CacheKeys.active_ads()
         cached = await redis_client.get(cache_key)
 
         if cached:
             try:
-                return json_loads(cached)
+                results = json_loads(cached)
+                _local_campaign_cache = (now, results)
+                return results
             except Exception:
                 pass
 
@@ -230,6 +247,7 @@ class TargetingRetrieval(BaseRetrieval):
                 json_dumps(campaign_list),
                 ttl=self._cache_ttl,
             )
+            _local_campaign_cache = (time.monotonic(), campaign_list)
 
         return campaign_list
 
@@ -374,6 +392,9 @@ class TargetingRetrieval(BaseRetrieval):
 
     async def refresh(self) -> None:
         """Clear cache to force refresh."""
+        global _local_campaign_cache
+        _local_campaign_cache = None
+        
         cache_key = CacheKeys.active_ads()
         await redis_client.delete(cache_key)
         logger.info("Targeting retrieval cache refreshed")
